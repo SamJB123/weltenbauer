@@ -23,7 +23,9 @@ export class UIController {
     seed: 123456,
     showGrid: true,
     randomizeSeed: () => this.randomizeSeed(),
-    testHighRes: () => this.testHighResolution()
+    testHighRes: () => this.testHighResolution(),
+    importHeightmap: () => this.importHeightmap(),
+    resetToNormal: () => this.resetToNormalTerrain()
   }
 
   private brushParams = {
@@ -48,6 +50,8 @@ export class UIController {
     exportHeightmap: () => this.exportHeightmap(),
     exportProject: () => this.exportProject()
   }
+
+
 
   private guideInfo = {
     orbitControls: "Drag to rotate, wheel to zoom",
@@ -126,8 +130,13 @@ export class UIController {
       '256x256 (66K vertices)': 256,
       '512x512 (262K vertices)': 512,
       '1024x1024 (1M vertices)': 1024,
+      '1025x1025 (1M vertices)': 1025,
+      '1536x1536 (2.4M vertices)': 1536,
       '2048x2048 (4.2M vertices)': 2048,
-      '4096x4096 (16.8M vertices)': 4096
+      '2049x2049 (4.2M vertices)': 2049,
+      '3072x3072 (9.4M vertices)': 3072,
+      '4096x4096 (16.8M vertices)': 4096,
+      '4097x4097 (16.8M vertices)': 4097
     }
 
     terrainFolder.add(this.terrainParams, 'resolution', resolutionOptions)
@@ -141,6 +150,14 @@ export class UIController {
     // Test high resolution button
     terrainFolder.add(this.terrainParams, 'testHighRes')
       .name('🧪 Test High Resolution')
+
+    // Import heightmap button
+    terrainFolder.add(this.terrainParams, 'importHeightmap')
+      .name('📁 Import Heightmap')
+
+    // Reset to normal terrain button
+    terrainFolder.add(this.terrainParams, 'resetToNormal')
+      .name('🔄 Reset to Normal')
 
     terrainFolder.add(this.terrainParams, 'geologicalComplexity', 0.0, 2.0, 0.1)
       .name('Geological Complexity')
@@ -591,5 +608,109 @@ export class UIController {
 
   public getProgressOverlay(): ProgressOverlay {
     return this.progressOverlay
+  }
+
+  private importHeightmap(): void {
+    // Create file input element
+    const input = document.createElement('input')
+    input.type = 'file'
+    input.accept = 'image/*'
+    input.style.display = 'none'
+    
+    input.onchange = async (event) => {
+      const file = (event.target as HTMLInputElement).files?.[0]
+      if (!file) return
+      
+      try {
+        console.log('📁 Processing heightmap:', file.name)
+        
+        // Create image element to load the file
+        const img = new Image()
+        const canvas = document.createElement('canvas')
+        const ctx = canvas.getContext('2d')!
+        
+        img.onload = async () => {
+          // Use source image resolution
+          const sourceWidth = img.width
+          const sourceHeight = img.height
+          const resolution = Math.max(sourceWidth, sourceHeight)
+          
+          // Use original resolution (capped at 4096 for performance)
+          const finalResolution = Math.min(resolution, 4096)
+          
+          console.log(`Source: ${sourceWidth}x${sourceHeight}, Using resolution: ${finalResolution}x${finalResolution}`)
+          
+          // Set canvas to final resolution
+          canvas.width = finalResolution
+          canvas.height = finalResolution
+          
+          // Draw image scaled to fit canvas
+          ctx.fillStyle = '#000000'
+          ctx.fillRect(0, 0, finalResolution, finalResolution)
+          
+          const scale = Math.min(finalResolution / sourceWidth, finalResolution / sourceHeight)
+          const scaledWidth = sourceWidth * scale
+          const scaledHeight = sourceHeight * scale
+          const offsetX = (finalResolution - scaledWidth) / 2
+          const offsetY = (finalResolution - scaledHeight) / 2
+          
+          ctx.drawImage(img, offsetX, offsetY, scaledWidth, scaledHeight)
+          
+          // Extract height data from canvas
+          const imageData = ctx.getImageData(0, 0, finalResolution, finalResolution)
+          const heightData = new Float32Array(finalResolution * finalResolution)
+          
+          // Convert RGB to height values (preserving original grayscale range)
+          for (let i = 0; i < heightData.length; i++) {
+            const pixelIndex = i * 4
+            const r = imageData.data[pixelIndex]
+            const g = imageData.data[pixelIndex + 1]  
+            const b = imageData.data[pixelIndex + 2]
+            
+            // Convert to grayscale but preserve original range instead of forcing -200 to +200
+            const gray = (r + g + b) / 3
+            heightData[i] = gray // Keep original 0-255 range, convert to height scale later
+          }
+          
+          // Update resolution if different
+          if (finalResolution !== this.terrainParams.resolution) {
+            this.terrainParams.resolution = finalResolution
+            this.terrainBuilder.setResolution(finalResolution)
+            this.updateResolutionInfo(finalResolution)
+          }
+          
+          // Update size to 1km as requested (but don't trigger regeneration during import)
+          this.terrainParams.size = 1
+          // Note: Not calling updateConfig here to avoid triggering generateTerrain() during import
+          // The size is already set in the TerrainBuilder.importHeightmap() method
+          
+          // Import the heightmap into terrain builder
+          await this.terrainBuilder.importHeightmap(heightData, finalResolution, file.name)
+          
+          console.log('✅ Heightmap imported successfully!')
+        }
+        
+        // Load the image
+        img.src = URL.createObjectURL(file)
+        
+      } catch (error) {
+        console.error('❌ Failed to import heightmap:', error)
+        alert('Failed to import heightmap. Please check the console for details.')
+      }
+    }
+    
+    // Trigger file selection
+    document.body.appendChild(input)
+    input.click()
+    document.body.removeChild(input)
+  }
+
+  private resetToNormalTerrain(): void {
+    const confirmReset = confirm('Reset to normal terrain generation? This will remove the imported heightmap and restore the default noise layers.')
+    
+    if (confirmReset) {
+      this.terrainBuilder.resetToNormalTerrain()
+      console.log('🔄 Reset to normal terrain generation mode')
+    }
   }
 } 

@@ -42,7 +42,8 @@ export enum NoiseType {
   BILLOW = 'billow',
   HYBRID = 'hybrid',
   VORONOI = 'voronoi',
-  WORLEY = 'worley'
+  WORLEY = 'worley',
+  HEIGHTMAP = 'heightmap'
 }
 
 export class AdvancedNoiseSystem {
@@ -355,12 +356,62 @@ export class AdvancedNoiseSystem {
       case NoiseType.HYBRID:
         return this.hybridNoise(x, y, config as HybridConfig)
       
+      case NoiseType.HEIGHTMAP:
+        return this.heightmapNoise(x, y, config)
+      
       default:
         return this.perlin(
           (x + config.offset.x) * config.frequency,
           (y + config.offset.y) * config.frequency
         )
     }
+  }
+
+  /**
+   * Sample height data from an imported heightmap
+   */
+  public heightmapNoise(x: number, y: number, config: any): number {
+    if (!config.heightData || !config.resolution) {
+      return 0
+    }
+
+    const heightData = config.heightData as Float32Array
+    const resolution = config.resolution as number
+
+    // Convert normalized coordinates (-1 to 1) to heightmap coordinates (0 to resolution-1)
+    const u = Math.max(0, Math.min(1, (x + 1) / 2))
+    const v = Math.max(0, Math.min(1, (y + 1) / 2))
+    
+    const pixelX = u * (resolution - 1)
+    const pixelY = v * (resolution - 1)
+    
+    // Bilinear interpolation for smooth sampling
+    const x0 = Math.floor(pixelX)
+    const x1 = Math.min(x0 + 1, resolution - 1)
+    const y0 = Math.floor(pixelY)
+    const y1 = Math.min(y0 + 1, resolution - 1)
+    
+    const fx = pixelX - x0
+    const fy = pixelY - y0
+    
+    const h00 = heightData[y0 * resolution + x0] || 0
+    const h10 = heightData[y0 * resolution + x1] || 0
+    const h01 = heightData[y1 * resolution + x0] || 0
+    const h11 = heightData[y1 * resolution + x1] || 0
+    
+    // Bilinear interpolation
+    const h0 = h00 * (1 - fx) + h10 * fx
+    const h1 = h01 * (1 - fx) + h11 * fx
+    const sampledValue = h0 * (1 - fy) + h1 * fy
+    
+    // Check if data is in preserved grayscale format (0-255) and convert to height range
+    if (sampledValue >= 0 && sampledValue <= 255) {
+      // Convert from grayscale (0-255) to height range (-200 to +200)
+      return (sampledValue / 255) * 400 - 200
+    }
+    
+    // Data is already in height range
+    return sampledValue
   }
 
   /**

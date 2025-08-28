@@ -42,6 +42,8 @@ export class TerrainBuilder {
 
   private customLayers: any[] = []
   private baseLayerWeightOverrides: Map<number, number> = new Map()
+  private isUsingImportedHeightmap: boolean = false // Flag to track if we're using imported heightmap
+  private originalHeightmapData: Float32Array | null = null // Store original heightmap for export
 
   private uiController: any = null
   
@@ -187,14 +189,15 @@ export class TerrainBuilder {
     const sunLight = new THREE.DirectionalLight(0xffffeb, 1.0)
     sunLight.position.set(100, 200, 50)
     sunLight.castShadow = true
-    sunLight.shadow.mapSize.width = 2048
-    sunLight.shadow.mapSize.height = 2048
+    sunLight.shadow.mapSize.width = 4096
+    sunLight.shadow.mapSize.height = 4096
     sunLight.shadow.camera.near = 0.5
-    sunLight.shadow.camera.far = 500
-    sunLight.shadow.camera.left = -200
-    sunLight.shadow.camera.right = 200
-    sunLight.shadow.camera.top = 200
-    sunLight.shadow.camera.bottom = -200
+    sunLight.shadow.camera.far = 1000
+    sunLight.shadow.camera.left = -1000
+    sunLight.shadow.camera.right = 1000
+    sunLight.shadow.camera.top = 1000
+    sunLight.shadow.camera.bottom = -1000
+    sunLight.shadow.bias = -0.0001
     this.scene.add(sunLight)
     
     // Secondary fill light to soften shadows
@@ -212,6 +215,8 @@ export class TerrainBuilder {
       0x444444
     )
     gridHelper.position.y = -0.1
+    gridHelper.receiveShadow = false
+    gridHelper.castShadow = false  // Prevent grid from casting shadows
     this.scene.add(gridHelper)
     this.gridHelper = gridHelper
   }
@@ -375,7 +380,16 @@ export class TerrainBuilder {
   }
 
   public getNoiseLayersData(): any {
-    // Get current layers data for UIController
+    // If we're using an imported heightmap, don't show base layers in the GUI
+    if (this.isUsingImportedHeightmap) {
+      return {
+        layers: this.customLayers, // Only show custom layers (which includes the heightmap layer)
+        baseLayers: [], // Empty base layers for the GUI
+        customLayers: this.customLayers
+      }
+    }
+    
+    // Normal behavior: show base layers + custom layers
     const geologicalComplexity = this.config.geologicalComplexity
     const featureScale = this.config.featureScale
     const terrainType = this.config.terrainType
@@ -407,32 +421,55 @@ export class TerrainBuilder {
       const sourceRes = this.config.resolution
       const scale = sourceRes / 150
       
-      // Find min/max for proper normalization
-      let min = Infinity
-      let max = -Infinity
-      for (let i = 0; i < heightData.length; i++) {
-        min = Math.min(min, heightData[i])
-        max = Math.max(max, heightData[i])
-      }
-      const range = max - min
-      
-      for (let y = 0; y < 150; y++) {
-        for (let x = 0; x < 150; x++) {
-          const sourceX = Math.min(sourceRes - 1, Math.floor(x * scale))
-          const sourceY = Math.min(sourceRes - 1, Math.floor(y * scale))
-          const sourceIndex = sourceY * sourceRes + sourceX
-          
-          const height = heightData[sourceIndex] || 0
-          
-          // Normalize height for display
-          const normalized = range > 0 ? (height - min) / range : 0.5
-          const value = Math.floor(Math.max(0, Math.min(1, normalized)) * 255)
-          
-          const index = (y * 150 + x) * 4
-          data[index] = value
-          data[index + 1] = value
-          data[index + 2] = value
-          data[index + 3] = 255
+      // For imported heightmaps, use original data to preserve brightness
+      if (this.isUsingImportedHeightmap && this.originalHeightmapData) {
+        // Use original grayscale data for preview (preserves brightness)
+        const originalData = this.originalHeightmapData
+        
+        for (let y = 0; y < 150; y++) {
+          for (let x = 0; x < 150; x++) {
+            const sourceX = Math.min(sourceRes - 1, Math.floor(x * scale))
+            const sourceY = Math.min(sourceRes - 1, Math.floor(y * scale))
+            const sourceIndex = sourceY * sourceRes + sourceX
+            
+            // Use original grayscale value directly (0-255 range)
+            const value = Math.floor(Math.max(0, Math.min(255, originalData[sourceIndex] || 0)))
+            
+            const index = (y * 150 + x) * 4
+            data[index] = value
+            data[index + 1] = value
+            data[index + 2] = value
+            data[index + 3] = 255
+          }
+        }
+      } else {
+        // Normal terrain generation - normalize height data for display
+        let min = Infinity
+        let max = -Infinity
+        for (let i = 0; i < heightData.length; i++) {
+          min = Math.min(min, heightData[i])
+          max = Math.max(max, heightData[i])
+        }
+        const range = max - min
+        
+        for (let y = 0; y < 150; y++) {
+          for (let x = 0; x < 150; x++) {
+            const sourceX = Math.min(sourceRes - 1, Math.floor(x * scale))
+            const sourceY = Math.min(sourceRes - 1, Math.floor(y * scale))
+            const sourceIndex = sourceY * sourceRes + sourceX
+            
+            const height = heightData[sourceIndex] || 0
+            
+            // Normalize height for display
+            const normalized = range > 0 ? (height - min) / range : 0.5
+            const value = Math.floor(Math.max(0, Math.min(1, normalized)) * 255)
+            
+            const index = (y * 150 + x) * 4
+            data[index] = value
+            data[index + 1] = value
+            data[index + 2] = value
+            data[index + 3] = 255
+          }
         }
       }
     } else {
@@ -456,6 +493,12 @@ export class TerrainBuilder {
     const ctx = canvas.getContext('2d')!
     const imageData = ctx.createImageData(canvas.width, canvas.height)
     const data = imageData.data
+
+    // Special handling for heightmap layers
+    if (layer.type === 'heightmap' && layer.config.heightData) {
+      this.generateHeightmapPreview(canvas, layer)
+      return
+    }
 
     // Sample the layer across the preview area
     const samples: number[] = []
@@ -491,6 +534,64 @@ export class TerrainBuilder {
     }
 
     ctx.putImageData(imageData, 0, 0)
+  }
+
+  private generateHeightmapPreview(canvas: HTMLCanvasElement, layer: any): void {
+    const ctx = canvas.getContext('2d')!
+    const heightData = layer.config.heightData as Float32Array
+    const resolution = layer.config.resolution as number
+    
+    // Create preview by sampling the heightmap
+    const imageData = ctx.createImageData(canvas.width, canvas.height)
+    const data = imageData.data
+    
+    // Check if this is preserved grayscale data (0-255) or height data
+    let min = Infinity
+    let max = -Infinity
+    for (let i = 0; i < heightData.length; i++) {
+      if (heightData[i] < min) min = heightData[i]
+      if (heightData[i] > max) max = heightData[i]
+    }
+    
+    const isPreservedGrayscale = min >= 0 && max <= 255
+    const range = max - min
+    
+    // Sample heightmap to preview size
+    for (let y = 0; y < canvas.height; y++) {
+      for (let x = 0; x < canvas.width; x++) {
+        // Map canvas coordinates to heightmap coordinates
+        const hx = Math.floor((x / canvas.width) * resolution)
+        const hy = Math.floor((y / canvas.height) * resolution)
+        const heightIndex = Math.min(hy * resolution + hx, heightData.length - 1)
+        
+        const height = heightData[heightIndex]
+        let value: number
+        
+        if (isPreservedGrayscale) {
+          // Data is already in grayscale range, use directly
+          value = Math.floor(Math.max(0, Math.min(255, height)))
+        } else {
+          // Convert from height range to grayscale
+          const normalized = range > 0 ? (height - min) / range : 0.5
+          value = Math.floor(Math.max(0, Math.min(1, normalized)) * 255)
+        }
+        
+        const pixelIndex = (y * canvas.width + x) * 4
+        data[pixelIndex] = value     // R
+        data[pixelIndex + 1] = value // G  
+        data[pixelIndex + 2] = value // B
+        data[pixelIndex + 3] = 255   // A
+      }
+    }
+    
+    ctx.putImageData(imageData, 0, 0)
+    
+    // Add text overlay to indicate this is a heightmap
+    ctx.fillStyle = 'rgba(255, 255, 255, 0.8)'
+    ctx.font = '10px Arial'
+    ctx.fillText('Heightmap', 4, 14)
+    ctx.fillStyle = 'rgba(0, 0, 0, 0.6)'
+    ctx.fillText(layer.config.filename || 'Imported', 4, 26)
   }
 
 
@@ -648,7 +749,20 @@ export class TerrainBuilder {
   }
 
   private normalizeAllWeights(): void {
-    // Get all current layers
+    // If using imported heightmap, only normalize custom layers
+    if (this.isUsingImportedHeightmap) {
+      // For imported heightmaps, just normalize the custom layers among themselves
+      const totalCustomWeight = this.customLayers.reduce((sum, layer) => sum + layer.weight, 0)
+      
+      if (totalCustomWeight > 0) {
+        this.customLayers.forEach(layer => {
+          layer.weight = layer.weight / totalCustomWeight
+        })
+      }
+      return
+    }
+    
+    // Normal behavior for non-imported terrain
     const geologicalComplexity = this.config.geologicalComplexity
     const featureScale = this.config.featureScale
     const terrainType = this.config.terrainType
@@ -684,7 +798,23 @@ export class TerrainBuilder {
   }
 
   public removeLayer(index: number): void {
-    // Get current terrain type layers count
+    // If using imported heightmap, only work with custom layers
+    if (this.isUsingImportedHeightmap) {
+      // For imported heightmaps, index directly maps to custom layers
+      if (index >= 0 && index < this.customLayers.length) {
+        this.customLayers.splice(index, 1)
+        console.log(`Removed custom layer at index ${index}`)
+        
+        // Normalize remaining weights to add up to 100%
+        this.normalizeAllWeights()
+        
+        // Regenerate terrain (this will trigger GUI update)
+        this.generateTerrain().catch(console.error)
+      }
+      return
+    }
+    
+    // Normal behavior for non-imported terrain
     const geologicalComplexity = this.config.geologicalComplexity
     const featureScale = this.config.featureScale
     const terrainType = this.config.terrainType
@@ -704,20 +834,28 @@ export class TerrainBuilder {
   }
 
     public updateLayerWeight(index: number, newWeight: number, skipRegeneration: boolean = false): void {
-    // Get current terrain type layers count
-    const geologicalComplexity = this.config.geologicalComplexity
-    const featureScale = this.config.featureScale
-    const terrainType = this.config.terrainType
-    const baseLayers = this.advancedTerrainGenerator.getTerrainTypeLayers(terrainType, geologicalComplexity, featureScale)
-    
-    if (index < baseLayers.length) {
-      // Store base layer weight override
-      this.baseLayerWeightOverrides.set(index, newWeight)
+    // If using imported heightmap, only work with custom layers
+    if (this.isUsingImportedHeightmap) {
+      // For imported heightmaps, index directly maps to custom layers
+      if (this.customLayers[index]) {
+        this.customLayers[index].weight = newWeight
+      }
     } else {
-      // Updating custom layer
-      const customIndex = index - baseLayers.length
-      if (this.customLayers[customIndex]) {
-        this.customLayers[customIndex].weight = newWeight
+      // Normal behavior for non-imported terrain
+      const geologicalComplexity = this.config.geologicalComplexity
+      const featureScale = this.config.featureScale
+      const terrainType = this.config.terrainType
+      const baseLayers = this.advancedTerrainGenerator.getTerrainTypeLayers(terrainType, geologicalComplexity, featureScale)
+      
+      if (index < baseLayers.length) {
+        // Store base layer weight override
+        this.baseLayerWeightOverrides.set(index, newWeight)
+      } else {
+        // Updating custom layer
+        const customIndex = index - baseLayers.length
+        if (this.customLayers[customIndex]) {
+          this.customLayers[customIndex].weight = newWeight
+        }
       }
     }
     
@@ -788,6 +926,7 @@ export class TerrainBuilder {
     if (this.isGenerating) {
       return
     }
+
     this.isGenerating = true
 
     // Start progress tracking
@@ -818,6 +957,19 @@ export class TerrainBuilder {
 
     let heightData: Float32Array
 
+    // Handle imported heightmaps differently
+    if (this.isUsingImportedHeightmap) {
+      if (this.uiController && this.uiController.getProgressOverlay) {
+        const progressOverlay = this.uiController.getProgressOverlay()
+        progressOverlay.updateTask('terrain-generation', 20, 'Regenerating heightmap terrain...')
+      }
+      
+      // For imported heightmaps, regenerate using the original heightmap data with custom layers
+      await this.regenerateHeightmapTerrain()
+      return
+    }
+
+    // Normal terrain generation for non-imported terrain
     if (this.config.advancedMode) {
         // Use advanced terrain generator with chunked processing
       this.advancedTerrainGenerator.updateConfig({
@@ -1293,6 +1445,7 @@ export class TerrainBuilder {
     this.terrain.position.y = -avgHeight * 0.5 // Center terrain around average height
     
     this.terrain.receiveShadow = true
+    this.terrain.castShadow = false  // Disable terrain self-shadowing to prevent artifacts
     this.scene.add(this.terrain)
 
     // Update grid position to align with terrain center
@@ -1533,7 +1686,7 @@ export class TerrainBuilder {
    * Get supported resolution options
    */
   public getSupportedResolutions(): number[] {
-    return [64, 128, 256, 512, 1024, 2048, 4096]
+    return [64, 128, 256, 512, 1024, 1025, 1536, 2048, 2049, 3072, 4096, 4097]
   }
 
   /**
@@ -1596,6 +1749,7 @@ export class TerrainBuilder {
   }
 
   public exportHeightmap(): string {
+    // Always export the current height data (including brush modifications)
     return this.advancedTerrainGenerator.exportHeightmapAsImage(
       this.brushSystem.getHeightData()
     )
@@ -2269,10 +2423,654 @@ export class TerrainBuilder {
 
   public exportAdvancedHeightmap(): string {
     if (this.config.advancedMode && this.terrain) {
+      // Always export the current height data (including brush modifications)
       return this.advancedTerrainGenerator.exportHeightmapAsImage(
         this.brushSystem.getHeightData()
       )
     }
     return this.exportHeightmap()
+  }
+
+  public async importHeightmap(heightData: Float32Array, resolution: number, filename: string): Promise<void> {
+    console.log(`📁 Importing heightmap: ${filename} (${resolution}x${resolution})`)
+    
+    // Store original heightmap data for export
+    this.originalHeightmapData = heightData.slice()
+    
+    // Clear existing terrain and layers
+    this.clearDefaultTerrain()
+    
+    // Update configuration
+    this.config.resolution = resolution
+    this.config.size = 1 // Set to 1km as requested
+    
+    // CRITICAL: Update AdvancedTerrainGenerator config to match imported resolution
+    this.advancedTerrainGenerator.updateConfig({
+      resolution: resolution,
+      size: 1
+    })
+    
+    // Create heightmap as a custom noise layer
+    this.addHeightmapAsNoiseLayer(heightData, filename)
+    
+    // Generate terrain from the imported heightmap
+    await this.generateTerrainFromHeightmap(heightData)
+    
+    // Update UI - final GUI update
+    this.updateNoiseLayersGUI()
+    
+          console.log('✅ Heightmap import completed')
+  }
+
+  /**
+   * Export heightmap as professional 16-bit grayscale PNG
+   */
+  private exportHeightmapWithCorrectResolution(heightData: Float32Array): string {
+    // Calculate resolution from height data length
+    const dataLength = heightData.length
+    const currentResolution = Math.sqrt(dataLength)
+    
+    if (currentResolution !== Math.floor(currentResolution)) {
+      console.error('Invalid heightmap data: not square', { dataLength, currentResolution })
+      return this.advancedTerrainGenerator.exportHeightmapAsImage(heightData)
+    }
+    
+    // Convert to power-of-two-plus-one resolution (513, 1025, 2049, etc.)
+    const targetResolution = this.getNearestPowerOfTwoPlusOne(currentResolution)
+    console.log(`Exporting heightmap: ${currentResolution}x${currentResolution} → ${targetResolution}x${targetResolution}`)
+    
+    // Resample if needed
+    const finalHeightData = currentResolution === targetResolution 
+      ? heightData 
+      : this.resampleHeightData(heightData, currentResolution, targetResolution)
+    
+    return this.createProfessionalHeightmapPNG(finalHeightData, targetResolution)
+  }
+
+  /**
+   * Get nearest power-of-two-plus-one resolution (513, 1025, 2049, etc.)
+   */
+  private getNearestPowerOfTwoPlusOne(resolution: number): number {
+    const powerOfTwoPlusOnes = [513, 1025, 2049, 4097, 8193]
+    
+    // Find the closest power-of-two-plus-one
+    let best = powerOfTwoPlusOnes[0]
+    let minDiff = Math.abs(resolution - best)
+    
+    for (const candidate of powerOfTwoPlusOnes) {
+      const diff = Math.abs(resolution - candidate)
+      if (diff < minDiff) {
+        minDiff = diff
+        best = candidate
+      }
+    }
+    
+    return best
+  }
+
+  /**
+   * Resample height data to target resolution using bilinear interpolation
+   */
+  private resampleHeightData(heightData: Float32Array, fromRes: number, toRes: number): Float32Array {
+    const result = new Float32Array(toRes * toRes)
+    const scale = (fromRes - 1) / (toRes - 1)
+    
+    for (let y = 0; y < toRes; y++) {
+      for (let x = 0; x < toRes; x++) {
+        const srcX = x * scale
+        const srcY = y * scale
+        
+        const x0 = Math.floor(srcX)
+        const x1 = Math.min(x0 + 1, fromRes - 1)
+        const y0 = Math.floor(srcY)
+        const y1 = Math.min(y0 + 1, fromRes - 1)
+        
+        const fx = srcX - x0
+        const fy = srcY - y0
+        
+        const h00 = heightData[y0 * fromRes + x0] || 0
+        const h10 = heightData[y0 * fromRes + x1] || 0
+        const h01 = heightData[y1 * fromRes + x0] || 0
+        const h11 = heightData[y1 * fromRes + x1] || 0
+        
+        const h0 = h00 * (1 - fx) + h10 * fx
+        const h1 = h01 * (1 - fx) + h11 * fx
+        const height = h0 * (1 - fy) + h1 * fy
+        
+        result[y * toRes + x] = height
+      }
+    }
+    
+    return result
+  }
+
+  /**
+   * Create professional 16-bit grayscale PNG (simulated with 8-bit precision for web compatibility)
+   */
+  private createProfessionalHeightmapPNG(heightData: Float32Array, resolution: number): string {
+    const canvas = document.createElement('canvas')
+    canvas.width = resolution
+    canvas.height = resolution
+    const ctx = canvas.getContext('2d')!
+    
+    // Check if this is preserved grayscale data (0-255 range) or height data
+    let min = Infinity
+    let max = -Infinity
+    for (let i = 0; i < heightData.length; i++) {
+      min = Math.min(min, heightData[i])
+      max = Math.max(max, heightData[i])
+    }
+    
+    console.log(`Heightmap export range: ${min.toFixed(2)} to ${max.toFixed(2)}`)
+    
+    // Create true grayscale image data (no RGBA)
+    const imageData = ctx.createImageData(resolution, resolution)
+    const data = imageData.data
+    
+    // If data is in 0-255 range (preserved grayscale), use directly
+    // Otherwise normalize from height range to grayscale
+    const isPreservedGrayscale = min >= 0 && max <= 255
+    
+    for (let i = 0; i < heightData.length; i++) {
+      let grayscale: number
+      
+      if (isPreservedGrayscale) {
+        // Data is already in grayscale range, use directly
+        grayscale = Math.floor(Math.max(0, Math.min(255, heightData[i])))
+      } else {
+        // Convert from height range to grayscale
+        const range = max - min
+        const normalized = range > 0 ? (heightData[i] - min) / range : 0
+        grayscale = Math.floor(normalized * 255)
+      }
+      
+      const pixelIndex = i * 4
+      data[pixelIndex] = grayscale     // Red = grayscale
+      data[pixelIndex + 1] = grayscale // Green = grayscale  
+      data[pixelIndex + 2] = grayscale // Blue = grayscale
+      data[pixelIndex + 3] = 255       // Alpha = opaque
+    }
+    
+    ctx.putImageData(imageData, 0, 0)
+    return canvas.toDataURL('image/png')
+  }
+
+  public resetToNormalTerrain(): void {
+    console.log('🔄 Resetting to normal terrain generation mode...')
+    
+    // Clean up any existing progress tasks first
+    const progressOverlay = this.uiController?.getProgressOverlay()
+    if (progressOverlay) {
+      progressOverlay.cancelTask('heightmap-terrain') // Cancel the old heightmap task
+      progressOverlay.hide() // Hide the overlay to clean slate
+    }
+    
+    // Reset the heightmap flag and clear original data
+    this.isUsingImportedHeightmap = false
+    this.originalHeightmapData = null
+    
+    // Clear base layer overrides to restore default weights
+    this.baseLayerWeightOverrides.clear()
+    
+    // Clear custom layers
+    this.customLayers.length = 0
+    
+    // Update the GUI to show base layers again
+    this.updateNoiseLayersGUI()
+    
+    // Auto-generate default terrain after reset (small delay to ensure cleanup completes)
+    console.log('🎲 Auto-generating default terrain...')
+    setTimeout(() => {
+      this.generateTerrain().catch(console.error)
+    }, 100)
+    
+    console.log('✅ Reset to normal terrain generation mode')
+  }
+
+  private clearDefaultTerrain(): void {
+    console.log('🧹 Clearing default terrain and noise layers...')
+    
+    // Set the flag to indicate we're now using an imported heightmap
+    this.isUsingImportedHeightmap = true
+    
+    // Get the base layers to disable them completely
+    const geologicalComplexity = this.config.geologicalComplexity
+    const featureScale = this.config.featureScale
+    const terrainType = this.config.terrainType
+    const baseLayers = this.advancedTerrainGenerator.getTerrainTypeLayers(terrainType, geologicalComplexity, featureScale)
+    
+    // Set ALL base layer weights to 0 to completely disable the default 3 noise layers
+    this.baseLayerWeightOverrides.clear()
+    baseLayers.forEach((_, index) => {
+      this.baseLayerWeightOverrides.set(index, 0.0)
+    })
+    
+    console.log(`🚫 Disabled ${baseLayers.length} default base layers`)
+    
+    // Clear custom layers (we'll replace them with the heightmap layer)
+    this.customLayers.length = 0
+    
+    // Force immediate GUI update after setting the flag
+    this.updateNoiseLayersGUI()
+    
+    // Clear existing terrain mesh if it exists
+    if (this.terrain && this.scene) {
+      this.scene.remove(this.terrain)
+      this.terrain.geometry.dispose()
+      if (this.terrain.material instanceof THREE.Material) {
+        this.terrain.material.dispose()
+      }
+      this.terrain = null
+    }
+    
+    // Clear the noise layers preview in the main UI container
+    if (this.noiseLayersContainer) {
+      // Clear all children except the header
+      const children = Array.from(this.noiseLayersContainer.children)
+      children.forEach((child, index) => {
+        if (index > 0) { // Keep the header (first child)
+          this.noiseLayersContainer.removeChild(child)
+        }
+      })
+    }
+    
+    // The main heightmap preview will be updated when we call updateNoisePreview()
+    
+    console.log('✅ Default terrain cleared')
+  }
+
+  private addHeightmapAsNoiseLayer(heightData: Float32Array, filename: string): void {
+    console.log('📊 Adding heightmap as noise layer...')
+    
+    // Create a special heightmap noise layer
+    const heightmapLayer = {
+      type: 'heightmap',
+      config: {
+        heightData: heightData,
+        filename: filename,
+        resolution: this.config.resolution
+      },
+      weight: 1.0 // Full weight since this is the primary data source
+    }
+    
+    // Add as the first (and only initial) custom layer
+    this.customLayers.push(heightmapLayer)
+    
+    console.log('✅ Heightmap added as noise layer')
+  }
+
+  private async generateTerrainFromHeightmap(heightData: Float32Array): Promise<void> {
+    console.log('🏔️ Generating terrain from heightmap...')
+    
+    try {
+      // Set up progress tracking - ensure overlay is shown
+      const progressOverlay = this.uiController?.getProgressOverlay()
+      if (progressOverlay) {
+        progressOverlay.show() // Explicitly show the overlay
+        progressOverlay.startTask('heightmap-terrain', 'Loading terrain from heightmap...')
+      }
+      
+      const { resolution } = this.config
+      
+      // Use chunked processing for high resolutions to enable worker processing
+      let processedHeightData: Float32Array
+      if (resolution >= 512) {
+        progressOverlay?.updateTask('heightmap-terrain', 15, 'Using chunked processing for high resolution heightmap...')
+        processedHeightData = await this.generateTerrainFromHeightmapChunked(heightData)
+      } else {
+        progressOverlay?.updateTask('heightmap-terrain', 20, 'Processing heightmap...')
+        processedHeightData = heightData
+      }
+      
+      // Create terrain geometry from processed height data
+      const geometry = new THREE.PlaneGeometry(
+        this.config.size * 1000, 
+        this.config.size * 1000, 
+        resolution - 1, 
+        resolution - 1
+      )
+      
+      // Update progress
+      progressOverlay?.updateTask('heightmap-terrain', 60, 'Applying height data to geometry...')
+      
+      // Apply height data to geometry vertices
+      // Note: PlaneGeometry with (resolution-1, resolution-1) segments has resolution*resolution vertices
+      const vertices = geometry.attributes.position.array as Float32Array
+      const expectedVertices = resolution * resolution
+      
+      console.log(`Applying ${processedHeightData.length} height values to ${expectedVertices} vertices`)
+      
+      // Verify data size matches expected vertices
+      if (processedHeightData.length !== expectedVertices) {
+        console.warn(`Height data size mismatch: ${processedHeightData.length} vs expected ${expectedVertices}`)
+      }
+      
+      // Check if we need to convert from preserved grayscale (0-255) to height values
+      let min = Infinity
+      let max = -Infinity
+      for (let i = 0; i < processedHeightData.length; i++) {
+        min = Math.min(min, processedHeightData[i])
+        max = Math.max(max, processedHeightData[i])
+      }
+      
+      const isPreservedGrayscale = min >= 0 && max <= 255
+      
+      for (let i = 0; i < Math.min(processedHeightData.length, expectedVertices); i++) {
+        const vertexIndex = i * 3 + 2 // Z coordinate
+        
+        if (isPreservedGrayscale) {
+          // Convert from grayscale (0-255) to height range (-200 to +200)
+          const normalizedGray = processedHeightData[i] / 255
+          vertices[vertexIndex] = normalizedGray * 400 - 200
+        } else {
+          // Data is already in height range
+          vertices[vertexIndex] = processedHeightData[i]
+        }
+      }
+      
+      // Update geometry
+      geometry.attributes.position.needsUpdate = true
+      geometry.computeVertexNormals()
+      
+      // Update progress
+      progressOverlay?.updateTask('heightmap-terrain', 40, 'Calculating height statistics...')
+      
+      // Calculate height statistics from the actual vertex data (after conversion)
+      const actualHeightData = new Float32Array(expectedVertices)
+      for (let i = 0; i < expectedVertices; i++) {
+        const vertexIndex = i * 3 + 2 // Z coordinate
+        actualHeightData[i] = vertices[vertexIndex]
+      }
+      
+      const { minHeight, maxHeight, avgHeight } = this.calculateHeightStats(actualHeightData)
+      console.log(`Height range: ${minHeight.toFixed(2)} to ${maxHeight.toFixed(2)}, avg: ${avgHeight.toFixed(2)}`)
+      
+      // Update progress
+      progressOverlay?.updateTask('heightmap-terrain', 60, 'Creating terrain material...')
+      
+      // Update terrain material with height range
+      this.terrainMaterial.updateHeightRange(minHeight, maxHeight)
+      
+      // Get the material (reuse existing one instead of creating new)
+      const material = this.terrainMaterial.getMaterial()
+      
+      // Update progress
+      progressOverlay?.updateTask('heightmap-terrain', 80, 'Finalizing terrain...')
+      
+      // Create terrain mesh
+      this.terrain = new THREE.Mesh(geometry, material)
+      this.terrain.rotation.x = -Math.PI / 2
+      this.terrain.receiveShadow = true
+      this.terrain.castShadow = false  // Disable terrain self-shadowing to prevent artifacts
+      
+      // Center the terrain properly relative to the grid (same as normal terrain)
+      this.terrain.position.y = -avgHeight * 0.5 // Center terrain around average height
+      
+      // Add to scene
+      if (this.scene) {
+        this.scene.add(this.terrain)
+      }
+      
+      // Update grid position to align with terrain center (same as normal terrain)
+      if (this.gridHelper) {
+        this.gridHelper.position.y = -avgHeight * 0.5 - 0.1 // Slightly below terrain center
+      }
+      
+      // Initialize brush system with converted height data
+      this.brushSystem.setTerrain(
+        this.terrain,
+        actualHeightData.slice(), // Use the converted height data that matches the vertices
+        resolution
+      )
+      
+      // Update noise preview to show imported heightmap
+      this.updateNoisePreview()
+      
+      // Complete progress
+      progressOverlay?.updateTask('heightmap-terrain', 100, 'Complete!')
+      progressOverlay?.completeTask('heightmap-terrain')
+      
+      console.log('✅ Terrain generated from heightmap')
+      
+    } catch (error) {
+      console.error('❌ Failed to generate terrain from heightmap:', error)
+      const progressOverlay = this.uiController?.getProgressOverlay()
+      progressOverlay?.hide()
+      throw error
+    }
+  }
+
+  /**
+   * Regenerate heightmap terrain with custom layers (called when layers are modified)
+   */
+  private async regenerateHeightmapTerrain(): Promise<void> {
+    if (!this.originalHeightmapData) {
+      console.error('No original heightmap data available for regeneration')
+      return
+    }
+
+    try {
+      // Start with the original heightmap data
+      let heightData = this.originalHeightmapData.slice()
+      
+      // Apply custom layers on top of the heightmap
+      if (this.customLayers.length > 1) { // More than just the heightmap layer
+        heightData = await this.applyHeightmapLayerAdjustments(heightData)
+      }
+      
+      // Regenerate the terrain mesh with the updated height data
+      await this.generateTerrainFromHeightmap(heightData)
+      
+    } catch (error) {
+      console.error('❌ Failed to regenerate heightmap terrain:', error)
+      throw error
+    }
+  }
+
+  /**
+   * Apply custom layers to heightmap data (excluding the base heightmap layer)
+   */
+  private async applyHeightmapLayerAdjustments(heightData: Float32Array): Promise<Float32Array> {
+    const { resolution } = this.config
+    const result = heightData.slice() // Start with heightmap as base
+    
+    // Apply custom layers (skip the first one which is the heightmap itself)
+    for (let i = 1; i < this.customLayers.length; i++) {
+      const layer = this.customLayers[i]
+      console.log(`Applying custom layer ${i} with weight: ${layer.weight}`)
+      
+      for (let y = 0; y < resolution; y++) {
+        for (let x = 0; x < resolution; x++) {
+          const index = y * resolution + x
+          
+          // Transform coordinates to noise space
+          const nx = (x / (resolution - 1)) * 2 - 1 + 0.001
+          const ny = (y / (resolution - 1)) * 2 - 1 + 0.001
+          
+          // Generate noise for this layer
+          const noise = this.advancedTerrainGenerator.getNoiseSystem().generateNoise(nx, ny, layer.type, layer.config)
+          
+          // Apply layer with its weight
+          result[index] += noise * layer.weight
+        }
+      }
+    }
+    
+    return result
+  }
+
+  /**
+   * Generate terrain from heightmap using chunked processing for better performance
+   */
+  private async generateTerrainFromHeightmapChunked(heightData: Float32Array): Promise<Float32Array> {
+    const { resolution } = this.config
+    const processedHeightData = new Float32Array(resolution * resolution)
+    
+    const chunksX = Math.ceil(resolution / this.chunkSize)
+    const chunksY = Math.ceil(resolution / this.chunkSize)
+    const totalChunks = chunksX * chunksY
+
+    const progressOverlay = this.uiController?.getProgressOverlay()
+    progressOverlay?.updateTask('heightmap-terrain', 20, 
+      `Processing ${totalChunks} heightmap chunks (${this.chunkSize}x${this.chunkSize} each) using ${this.workers.length} workers...`)
+
+    // For now, copy data in chunks to enable future worker processing
+    // This provides the infrastructure for worker-based heightmap processing
+    if (this.workers.length === 0) {
+      return this.generateHeightmapChunkedSingleThreaded(heightData)
+    }
+
+    return this.generateHeightmapChunkedParallel(heightData, chunksX, chunksY, totalChunks, processedHeightData)
+  }
+
+  /**
+   * Parallel heightmap processing using worker pool (future enhancement)
+   */
+  private async generateHeightmapChunkedParallel(
+    heightData: Float32Array,
+    chunksX: number, 
+    chunksY: number, 
+    totalChunks: number, 
+    processedHeightData: Float32Array
+  ): Promise<Float32Array> {
+    const { resolution } = this.config
+    let processedChunks = 0
+    const pendingChunks: Promise<void>[] = []
+
+    // Create chunk processing promises
+    for (let chunkY = 0; chunkY < chunksY; chunkY++) {
+      for (let chunkX = 0; chunkX < chunksX; chunkX++) {
+        const startX = chunkX * this.chunkSize
+        const startY = chunkY * this.chunkSize
+        const endX = Math.min(startX + this.chunkSize, resolution)
+        const endY = Math.min(startY + this.chunkSize, resolution)
+        
+        const chunkPromise = this.processHeightmapChunkWithWorker(
+          heightData, startX, startY, endX, endY, processedHeightData, `${chunkX}-${chunkY}`
+        ).then(() => {
+          processedChunks++
+          
+          // Update progress periodically
+          if (processedChunks % Math.max(1, Math.floor(totalChunks / 10)) === 0) {
+            const progress = 20 + (processedChunks / totalChunks * 40)
+            
+            const progressOverlay = this.uiController?.getProgressOverlay()
+            progressOverlay?.updateTask('heightmap-terrain', progress, 
+              `Processed ${processedChunks}/${totalChunks} heightmap chunks...`)
+          }
+        })
+        
+        pendingChunks.push(chunkPromise)
+      }
+    }
+
+    // Wait for all chunks to complete
+    await Promise.all(pendingChunks)
+    
+    const progressOverlay = this.uiController?.getProgressOverlay()
+    progressOverlay?.updateTask('heightmap-terrain', 60, 'Parallel heightmap processing complete!')
+    
+    return processedHeightData
+  }
+
+  /**
+   * Process a single heightmap chunk using a worker from the pool
+   */
+  private async processHeightmapChunkWithWorker(
+    heightData: Float32Array,
+    startX: number,
+    startY: number,
+    endX: number,
+    endY: number,
+    processedHeightData: Float32Array,
+    chunkId: string
+  ): Promise<void> {
+    const { resolution } = this.config
+    
+    // For now, use direct processing (future enhancement: actual worker-based heightmap processing)
+    // This provides the infrastructure for future worker-based heightmap processing
+    try {
+      // Copy chunk data
+      for (let y = startY; y < endY; y++) {
+        for (let x = startX; x < endX; x++) {
+          const targetIndex = y * resolution + x
+          
+          // For now, just copy the data (future: apply worker processing)
+          if (targetIndex < heightData.length) {
+            processedHeightData[targetIndex] = heightData[targetIndex]
+          }
+        }
+      }
+    } catch (error) {
+      console.warn(`Heightmap processing failed for chunk ${chunkId}, using fallback:`, error)
+      
+      // Fallback: copy original data
+      for (let y = startY; y < endY; y++) {
+        for (let x = startX; x < endX; x++) {
+          const targetIndex = y * resolution + x
+          processedHeightData[targetIndex] = heightData[targetIndex]
+        }
+      }
+    }
+  }
+
+  /**
+   * Fallback single-threaded heightmap processing
+   */
+  private async generateHeightmapChunkedSingleThreaded(heightData: Float32Array): Promise<Float32Array> {
+    const { resolution } = this.config
+    const processedHeightData = new Float32Array(resolution * resolution)
+    
+    const chunksX = Math.ceil(resolution / this.chunkSize)
+    const chunksY = Math.ceil(resolution / this.chunkSize)
+    let processedChunks = 0
+    const totalChunks = chunksX * chunksY
+
+    for (let chunkY = 0; chunkY < chunksY; chunkY++) {
+      for (let chunkX = 0; chunkX < chunksX; chunkX++) {
+        const startX = chunkX * this.chunkSize
+        const startY = chunkY * this.chunkSize
+        const endX = Math.min(startX + this.chunkSize, resolution)
+        const endY = Math.min(startY + this.chunkSize, resolution)
+        
+        await this.processHeightmapChunk(heightData, processedHeightData, startX, startY, endX, endY)
+        
+        processedChunks++
+        
+        if (processedChunks % 4 === 0) {
+          const progress = 20 + (processedChunks / totalChunks * 40)
+          
+          const progressOverlay = this.uiController?.getProgressOverlay()
+          progressOverlay?.updateTask('heightmap-terrain', progress, 
+            `Processed ${processedChunks}/${totalChunks} heightmap chunks (single-threaded)...`)
+          
+          await this.yieldControl()
+        }
+      }
+    }
+    
+    return processedHeightData
+  }
+
+  /**
+   * Process a single heightmap chunk
+   */
+  private async processHeightmapChunk(
+    heightData: Float32Array, 
+    processedHeightData: Float32Array,
+    startX: number, 
+    startY: number, 
+    endX: number, 
+    endY: number
+  ): Promise<void> {
+    const { resolution } = this.config
+    
+    // For now, just copy the data (future: apply processing/filtering)
+    for (let y = startY; y < endY; y++) {
+      for (let x = startX; x < endX; x++) {
+        const index = y * resolution + x
+        processedHeightData[index] = heightData[index]
+      }
+    }
   }
 } 
