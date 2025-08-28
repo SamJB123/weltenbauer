@@ -2,7 +2,7 @@ import { AdvancedNoiseSystem } from './AdvancedNoiseSystem'
 import { AdvancedTerrainGenerator, TerrainType, AdvancedTerrainConfig } from './AdvancedTerrainGenerator'
 
 export interface TerrainWorkerMessage {
-  type: 'processChunk'
+  type: 'processChunk' | 'heightmap'
   data: {
     chunkId: string
     startX: number
@@ -10,10 +10,11 @@ export interface TerrainWorkerMessage {
     endX: number
     endY: number
     resolution: number
-    terrainType: TerrainType
+    terrainType?: TerrainType
     config: AdvancedTerrainConfig
     baseLayerWeightOverrides?: Map<string, number>
     customLayers?: any[]
+    heightData?: Float32Array // For heightmap processing
   }
 }
 
@@ -41,6 +42,24 @@ class TerrainWorkerInstance {
   }
 
   public processChunk(message: TerrainWorkerMessage): TerrainWorkerResponse {
+    try {
+      if (message.type === 'heightmap') {
+        return this.processHeightmapChunk(message)
+      } else {
+        return this.processTerrainChunk(message)
+      }
+    } catch (error) {
+      return {
+        type: 'error',
+        data: {
+          chunkId: message.data.chunkId,
+          error: error instanceof Error ? error.message : String(error)
+        }
+      }
+    }
+  }
+
+  private processTerrainChunk(message: TerrainWorkerMessage): TerrainWorkerResponse {
     const { chunkId, startX, startY, endX, endY, resolution, terrainType, config } = message.data
     
     // Update terrain generator config
@@ -58,8 +77,9 @@ class TerrainWorkerInstance {
     const reliefAmplitude = config.reliefAmplitude ?? 1.0
     const featureScale = config.featureScale ?? 1.5
 
-    // Generate base layers based on terrain type
-    const layers = this.terrainGenerator.getTerrainTypeLayers(terrainType, geologicalComplexity, featureScale)
+    // Generate base layers based on terrain type (use default if not provided)
+    const effectiveTerrainType = terrainType || TerrainType.CONTINENTAL
+    const layers = this.terrainGenerator.getTerrainTypeLayers(effectiveTerrainType, geologicalComplexity, featureScale)
 
     // Process each point in the chunk
     for (let localY = 0; localY < chunkHeight; localY++) {
@@ -128,6 +148,55 @@ class TerrainWorkerInstance {
       data: {
         chunkId,
         heightData,
+        startX,
+        startY,
+        endX,
+        endY
+      }
+    }
+  }
+
+  private processHeightmapChunk(message: TerrainWorkerMessage): TerrainWorkerResponse {
+    const { chunkId, startX, startY, endX, endY, heightData: inputHeightData } = message.data
+    
+    if (!inputHeightData) {
+      return {
+        type: 'error',
+        data: {
+          chunkId,
+          error: 'No heightmap data provided for heightmap chunk processing'
+        }
+      }
+    }
+
+    // Create height data for this chunk
+    const chunkWidth = endX - startX
+    const chunkHeight = endY - startY
+    const chunkHeightData = new Float32Array(chunkWidth * chunkHeight)
+
+    // For now, simply copy/process the heightmap data
+    // Future enhancements: filtering, smoothing, erosion simulation, etc.
+    for (let localY = 0; localY < chunkHeight; localY++) {
+      for (let localX = 0; localX < chunkWidth; localX++) {
+        const localIndex = localY * chunkWidth + localX
+        
+        // Calculate source index in the input heightmap data (row-based data)
+        const sourceIndex = localY * chunkWidth + localX
+        
+        // Copy height data with potential future processing
+        if (sourceIndex < inputHeightData.length) {
+          chunkHeightData[localIndex] = inputHeightData[sourceIndex]
+        } else {
+          chunkHeightData[localIndex] = 0 // Default height for missing data
+        }
+      }
+    }
+
+    return {
+      type: 'chunkComplete',
+      data: {
+        chunkId,
+        heightData: chunkHeightData,
         startX,
         startY,
         endX,

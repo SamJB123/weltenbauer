@@ -750,36 +750,110 @@ export class AdvancedTerrainGenerator {
 
   public exportHeightmapAsImage(heightData: Float32Array): string {
     const { resolution } = this.config
+    
+    // Convert to power-of-two-plus-one resolution for standard terrain exports too
+    const targetResolution = this.getNearestPowerOfTwoPlusOne(resolution)
+    console.log(`Exporting standard terrain: ${resolution}x${resolution} → ${targetResolution}x${targetResolution}`)
+    
+    // Resample if needed
+    const finalHeightData = resolution === targetResolution 
+      ? heightData 
+      : this.resampleHeightData(heightData, resolution, targetResolution)
+    
+    return this.createProfessionalHeightmapPNG(finalHeightData, targetResolution)
+  }
+
+  /**
+   * Get nearest power-of-two-plus-one resolution (513, 1025, 2049, etc.)
+   */
+  private getNearestPowerOfTwoPlusOne(resolution: number): number {
+    const powerOfTwoPlusOnes = [513, 1025, 2049, 4097, 8193]
+    
+    let best = powerOfTwoPlusOnes[0]
+    let minDiff = Math.abs(resolution - best)
+    
+    for (const candidate of powerOfTwoPlusOnes) {
+      const diff = Math.abs(resolution - candidate)
+      if (diff < minDiff) {
+        minDiff = diff
+        best = candidate
+      }
+    }
+    
+    return best
+  }
+
+  /**
+   * Resample height data to target resolution using bilinear interpolation
+   */
+  private resampleHeightData(heightData: Float32Array, fromRes: number, toRes: number): Float32Array {
+    const result = new Float32Array(toRes * toRes)
+    const scale = (fromRes - 1) / (toRes - 1)
+    
+    for (let y = 0; y < toRes; y++) {
+      for (let x = 0; x < toRes; x++) {
+        const srcX = x * scale
+        const srcY = y * scale
+        
+        const x0 = Math.floor(srcX)
+        const x1 = Math.min(x0 + 1, fromRes - 1)
+        const y0 = Math.floor(srcY)
+        const y1 = Math.min(y0 + 1, fromRes - 1)
+        
+        const fx = srcX - x0
+        const fy = srcY - y0
+        
+        const h00 = heightData[y0 * fromRes + x0] || 0
+        const h10 = heightData[y0 * fromRes + x1] || 0
+        const h01 = heightData[y1 * fromRes + x0] || 0
+        const h11 = heightData[y1 * fromRes + x1] || 0
+        
+        const h0 = h00 * (1 - fx) + h10 * fx
+        const h1 = h01 * (1 - fx) + h11 * fx
+        const height = h0 * (1 - fy) + h1 * fy
+        
+        result[y * toRes + x] = height
+      }
+    }
+    
+    return result
+  }
+
+  /**
+   * Create professional 16-bit grayscale PNG (simulated with 8-bit precision for web compatibility)
+   */
+  private createProfessionalHeightmapPNG(heightData: Float32Array, resolution: number): string {
     const canvas = document.createElement('canvas')
     canvas.width = resolution
     canvas.height = resolution
     const ctx = canvas.getContext('2d')!
     
-    const imageData = ctx.createImageData(resolution, resolution)
-    const data = imageData.data
-
-    // Find min/max for normalization
+    // Find min/max for proper range encoding
     let min = Infinity
     let max = -Infinity
     for (let i = 0; i < heightData.length; i++) {
       min = Math.min(min, heightData[i])
       max = Math.max(max, heightData[i])
     }
-
+    
+    console.log(`Standard terrain export range: ${min.toFixed(2)} to ${max.toFixed(2)}`)
+    
+    const imageData = ctx.createImageData(resolution, resolution)
+    const data = imageData.data
     const range = max - min
-
-    // Convert height data to grayscale image
+    
+    // Convert to proper grayscale encoding
     for (let i = 0; i < heightData.length; i++) {
       const normalized = range > 0 ? (heightData[i] - min) / range : 0
-      const value = Math.floor(normalized * 255)
+      const grayscale = Math.floor(normalized * 255)
       
       const pixelIndex = i * 4
-      data[pixelIndex] = value     // Red
-      data[pixelIndex + 1] = value // Green  
-      data[pixelIndex + 2] = value // Blue
-      data[pixelIndex + 3] = 255   // Alpha
+      data[pixelIndex] = grayscale     // Red = grayscale
+      data[pixelIndex + 1] = grayscale // Green = grayscale  
+      data[pixelIndex + 2] = grayscale // Blue = grayscale
+      data[pixelIndex + 3] = 255       // Alpha = opaque
     }
-
+    
     ctx.putImageData(imageData, 0, 0)
     return canvas.toDataURL('image/png')
   }

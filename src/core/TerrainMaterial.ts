@@ -378,7 +378,7 @@ export class TerrainMaterial {
       const snowNoise = mx_noise_float(worldPos.xz.mul(0.02)).mul(5.0)
       
       // Create dirt/grass base layer (0-30% height) using noise patches
-      smoothstep(
+      const baseDirtGrassWeight = smoothstep(
         grassDirtHeight.add(heightNoise).sub(5.0),
         grassDirtHeight.add(heightNoise).add(5.0),
         height
@@ -391,8 +391,8 @@ export class TerrainMaterial {
       // Create the base dirt/grass layer
       const baseDirtGrassColor = mix(grassColor, dirtColor, dirtPatchWeight)
       
-      // Start with the dirt/grass base layer
-      const finalColor = baseDirtGrassColor.toVar()
+      // Start with rock as default, then blend in dirt/grass at low elevations
+      const finalColor = mix(rockColor, baseDirtGrassColor, baseDirtGrassWeight).toVar()
       
       // Rock blending (25-85% height range, enhanced on slopes)
       const adjustedRockHeight = rockHeight.add(heightNoise)
