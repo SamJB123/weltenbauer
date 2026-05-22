@@ -60,6 +60,9 @@ export class BrushSystem {
 
   private raycaster = new THREE.Raycaster()
   private mouse = new THREE.Vector2()
+  // Reused for cheap ray↔height-plane picking (avoids full-mesh raycasts).
+  private pickPlane = new THREE.Plane(new THREE.Vector3(0, 1, 0), 0)
+  private pickPoint = new THREE.Vector3()
   private isMouseDown = false
   private isActive = false
   
@@ -187,12 +190,8 @@ export class BrushSystem {
   public handleMouseUp(): void {
     this.isMouseDown = false
     this._brushStarted = false
-
-    // Ensure normals are computed after brushing stops for high resolution terrains
-    if (this.isHighResolution && this.terrain) {
-      const geometry = this.terrain.geometry as THREE.PlaneGeometry
-      geometry.computeVertexNormals()
-    }
+    // Normals are maintained per-region during the stroke (recomputeNormalsInRegion),
+    // so no full-mesh recompute is needed here.
   }
 
   private updateMousePosition(event: MouseEvent, canvas: HTMLCanvasElement): void {
@@ -201,16 +200,48 @@ export class BrushSystem {
     this.mouse.y = -((event.clientY - rect.top) / rect.height) * 2 + 1
   }
 
+  /**
+   * Find the terrain point under the cursor without a full-mesh raycast. The
+   * terrain is a heightfield, so we intersect the camera ray with a horizontal
+   * plane and refine it once against the sampled surface height — O(1) instead of
+   * testing every triangle.
+   */
+  private getSurfacePoint(camera: THREE.Camera): THREE.Vector3 | null {
+    if (!this.terrain || !this.heightData) return null
+
+    this.raycaster.setFromCamera(this.mouse, camera)
+    const ray = this.raycaster.ray
+    const baseY = this.terrain.position.y
+
+    this.pickPlane.normal.set(0, 1, 0)
+    this.pickPlane.constant = -baseY
+    if (!ray.intersectPlane(this.pickPlane, this.pickPoint)) return null
+
+    // Refine: re-intersect against a plane at the actual surface height there.
+    for (let iter = 0; iter < 2; iter++) {
+      const { index } = this.worldToCell(this.pickPoint)
+      this.pickPlane.constant = -(this.heightData[index] + baseY)
+      if (!ray.intersectPlane(this.pickPlane, this.pickPoint)) break
+    }
+    return this.pickPoint
+  }
+
+  /** Map a world-space point to the nearest heightmap cell (clamped to bounds). */
+  private worldToCell(world: THREE.Vector3): { x: number; z: number; index: number } {
+    const halfSize = this.terrainSize / 2
+    const res = this.resolution
+    const x = Math.max(0, Math.min(res - 1, Math.floor(((world.x + halfSize) / this.terrainSize) * res)))
+    const z = Math.max(0, Math.min(res - 1, Math.floor(((world.z + halfSize) / this.terrainSize) * res)))
+    return { x, z, index: z * res + x }
+  }
+
   private updateBrushPreview(camera: THREE.Camera): void {
     if (!this.terrain || !this.brushPreview) return
 
-    this.raycaster.setFromCamera(this.mouse, camera)
-    const intersects = this.raycaster.intersectObject(this.terrain)
-    
-    if (intersects.length > 0) {
-      const intersect = intersects[0]
-      this.brushPreview.position.copy(intersect.point)
-      this.brushPreview.position.y += 0.1 // Slightly above terrain
+    const point = this.getSurfacePoint(camera)
+    if (point) {
+      this.brushPreview.position.copy(point)
+      this.brushPreview.position.y += 0.5 // Slightly above terrain
       this.brushPreview.visible = true
     } else {
       this.brushPreview.visible = false
@@ -220,46 +251,21 @@ export class BrushSystem {
   private setFlattenHeight(camera: THREE.Camera): void {
     if (!this.terrain || !this.heightData) return
 
-    this.raycaster.setFromCamera(this.mouse, camera)
-    const intersects = this.raycaster.intersectObject(this.terrain)
-    
-    if (intersects.length === 0) return
+    const point = this.getSurfacePoint(camera)
+    if (!point) return
 
-    const intersect = intersects[0]
-    const worldPosition = intersect.point
-
-    // Convert world position to heightmap coordinates
-    const halfSize = this.terrainSize / 2
-    const hmapX = Math.floor(((worldPosition.x + halfSize) / this.terrainSize) * this.resolution)
-    const hmapZ = Math.floor(((worldPosition.z + halfSize) / this.terrainSize) * this.resolution)
-
-    // Clamp coordinates
-    const clampedX = Math.max(0, Math.min(this.resolution - 1, hmapX))
-    const clampedZ = Math.max(0, Math.min(this.resolution - 1, hmapZ))
-    
     // Set flatten height to the height at the center point where the mouse clicked
-    const index = clampedZ * this.resolution + clampedX
-    this.flattenHeight = this.heightData[index]
+    this.flattenHeight = this.heightData[this.worldToCell(point).index]
   }
 
   private applyBrush(camera: THREE.Camera): void {
     if (!this.terrain || !this.heightData) return
 
-    this.raycaster.setFromCamera(this.mouse, camera)
-    const intersects = this.raycaster.intersectObject(this.terrain)
-    
-    if (intersects.length === 0) return
+    const point = this.getSurfacePoint(camera)
+    if (!point) return
 
-    const intersect = intersects[0]
-    const worldPosition = intersect.point
-
-    // Convert world position to heightmap coordinates
-    const halfSize = this.terrainSize / 2
-    const hmapX = Math.floor(((worldPosition.x + halfSize) / this.terrainSize) * this.resolution)
-    const hmapZ = Math.floor(((worldPosition.z + halfSize) / this.terrainSize) * this.resolution)
-
-    // Apply brush effect
-    this.modifyHeightmap(hmapX, hmapZ)
+    const { x, z } = this.worldToCell(point)
+    this.modifyHeightmap(x, z)
     this.updateTerrainMesh()
   }
 
@@ -444,25 +450,33 @@ export class BrushSystem {
     if (!this.terrain || !this.heightData) return
 
     const geometry = this.terrain.geometry as THREE.PlaneGeometry
-    const vertices = geometry.attributes.position.array as Float32Array
+    const positionAttr = geometry.attributes.position
+    const normalAttr = geometry.attributes.normal
+    const vertices = positionAttr.array as Float32Array
 
-    // For high resolution, only update affected region if available
     if (this.affectedRegion) {
-      this.updateVerticesInRegion(vertices, this.affectedRegion)
-      this.affectedRegion = null // Clear after use
-    } else {
-      // Fallback to chunked full update if no region specified
-      this.updateVerticesChunked(vertices)
-    }
+      const region = this.affectedRegion
+      this.updateVerticesInRegion(vertices, region)
 
-    geometry.attributes.position.needsUpdate = true
-    
-    // Skip expensive normal computation for real-time brushing on high res
-    // We'll compute it on brush release instead
-    if (!this.isMouseDown) {
+      // Recompute normals analytically for just the brushed band — cheap enough to
+      // do live every frame, so lighting stays correct without a full recompute.
+      this.recomputeNormalsInRegion(normalAttr.array as Float32Array, region)
+
+      // Only re-upload the affected band of rows instead of the whole buffer.
+      const z0 = Math.max(0, region.minZ - 1)
+      const z1 = Math.min(this.resolution - 1, region.maxZ + 1)
+      this.setBandUpdateRange(positionAttr, z0, z1)
+      this.setBandUpdateRange(normalAttr, z0, z1)
+      normalAttr.needsUpdate = true
+
+      this.affectedRegion = null
+    } else {
+      // Fallback: full update (e.g. mountain preset without a tracked region).
+      this.updateVerticesChunked(vertices)
       geometry.computeVertexNormals()
     }
-    
+
+    positionAttr.needsUpdate = true
     this.updateMaterialHeightRange()
   }
 
@@ -470,13 +484,68 @@ export class BrushSystem {
     if (!this.heightData) return
 
     const { minX, maxX, minZ, maxZ } = region
-    
+
     for (let z = Math.max(0, minZ); z <= Math.min(this.resolution - 1, maxZ); z++) {
       for (let x = Math.max(0, minX); x <= Math.min(this.resolution - 1, maxX); x++) {
         const index = z * this.resolution + x
         vertices[index * 3 + 2] = this.heightData[index]
       }
     }
+  }
+
+  /**
+   * Recompute vertex normals for the brushed region (plus a 1-cell border) from
+   * the heightfield gradient, in the geometry's local space. Much cheaper than a
+   * full computeVertexNormals() and scales with brush size, not terrain size.
+   */
+  private recomputeNormalsInRegion(normals: Float32Array, region: { minX: number; maxX: number; minZ: number; maxZ: number }): void {
+    if (!this.heightData) return
+
+    const res = this.resolution
+    const h = this.heightData
+    const step = this.terrainSize / (res - 1)
+
+    const x0 = Math.max(0, region.minX - 1)
+    const x1 = Math.min(res - 1, region.maxX + 1)
+    const z0 = Math.max(0, region.minZ - 1)
+    const z1 = Math.min(res - 1, region.maxZ + 1)
+
+    for (let z = z0; z <= z1; z++) {
+      const zu = z > 0 ? z - 1 : z
+      const zd = z < res - 1 ? z + 1 : z
+      const dz = (zd - zu) * step
+      for (let x = x0; x <= x1; x++) {
+        const xl = x > 0 ? x - 1 : x
+        const xr = x < res - 1 ? x + 1 : x
+        const dx = (xr - xl) * step
+
+        const dhdx = dx > 0 ? (h[z * res + xr] - h[z * res + xl]) / dx : 0
+        const dhdz = dz > 0 ? (h[zd * res + x] - h[zu * res + x]) / dz : 0
+
+        // Local heightfield normal (the plane's local Y runs opposite grid Z).
+        let nx = -dhdx
+        let ny = dhdz
+        let nz = 1
+        const inv = 1 / Math.hypot(nx, ny, nz)
+        nx *= inv; ny *= inv; nz *= inv
+
+        const i = (z * res + x) * 3
+        normals[i] = nx
+        normals[i + 1] = ny
+        normals[i + 2] = nz
+      }
+    }
+  }
+
+  /** Flag only the given band of rows for GPU re-upload (falls back to full upload if unsupported). */
+  private setBandUpdateRange(attr: THREE.BufferAttribute | THREE.InterleavedBufferAttribute, z0: number, z1: number): void {
+    const anyAttr = attr as any
+    if (typeof anyAttr.clearUpdateRanges !== 'function' || typeof anyAttr.addUpdateRange !== 'function') return
+    const itemSize = attr.itemSize
+    const start = z0 * this.resolution * itemSize
+    const count = ((z1 + 1) * this.resolution - z0 * this.resolution) * itemSize
+    anyAttr.clearUpdateRanges()
+    anyAttr.addUpdateRange(start, count)
   }
 
   private updateVerticesChunked(vertices: Float32Array): void {

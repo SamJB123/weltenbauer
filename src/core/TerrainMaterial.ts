@@ -448,8 +448,8 @@ export class TerrainMaterial {
       // four triplanar textures by per-vertex biome surface weights, then tint by
       // the blended biome palette color. Mixed in by `biomeBlend` so the normal
       // height/slope look is untouched at biomeBlend = 0.
-      const surfaceWeight = attribute('surfaceWeight', 'vec4')
-      const biomeTint = attribute('biomeTint', 'vec3')
+      const surfaceWeight = attribute<'vec4'>('surfaceWeight', 'vec4')
+      const biomeTint = attribute<'vec3'>('biomeTint', 'vec3')
       const biomeSurface = dirtColor.mul(surfaceWeight.x)
         .add(grassColor.mul(surfaceWeight.y))
         .add(rockColor.mul(surfaceWeight.z))

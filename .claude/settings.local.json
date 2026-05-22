@@ -2,7 +2,13 @@
   "permissions": {
     "allow": [
       "Bash(dir *)",
-      "Bash(npx tsc *)"
+      "Bash(npx tsc *)",
+      "Bash(node -e \"const p=require\\('./package.json'\\); console.log\\('deps:', JSON.stringify\\({...p.dependencies, ...p.devDependencies}, null, 2\\)\\)\")",
+      "Bash(node -e \"try{console.log\\('three-mesh-bvh', require\\('three-mesh-bvh/package.json'\\).version\\)}catch\\(e\\){console.log\\('three-mesh-bvh NOT FOUND'\\)}; try{console.log\\('three-bvh-csg', require\\('three-bvh-csg/package.json'\\).version\\)}catch\\(e\\){console.log\\('three-bvh-csg NOT FOUND'\\)}; console.log\\('three', require\\('three/package.json'\\).version\\)\")",
+      "Bash(node -e \"const p=require\\('./package.json'\\); console.log\\(JSON.stringify\\({...p.dependencies,...p.devDependencies},null,2\\)\\)\")",
+      "Bash(node -e \"let s='';process.stdin.on\\('data',d=>s+=d\\).on\\('end',\\(\\)=>console.log\\('three', JSON.parse\\(s\\).version\\)\\)\")",
+      "Bash(node -e \"const p=require\\('./node_modules/three/package.json'\\); console.log\\(JSON.stringify\\(p.exports['./tsl'],null,2\\)\\)\")",
+      "WebSearch"
     ]
   }
 }

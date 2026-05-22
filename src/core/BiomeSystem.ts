@@ -62,9 +62,9 @@ export interface BiomeOptions {
 
 export interface BiomeField {
   resolution: number
-  index: Uint8Array         // dominant biome id per cell (length n)
-  topIndices: Uint8Array    // top-4 biome ids per cell (length n*4)
-  topWeights: Float32Array  // matching normalized weights, sum to 1 (length n*4)
+  index: Uint8Array<ArrayBuffer>         // dominant biome id per cell (length n)
+  topIndices: Uint8Array<ArrayBuffer>    // top-4 biome ids per cell (length n*4)
+  topWeights: Float32Array<ArrayBuffer>  // matching normalized weights, sum to 1 (length n*4)
 }
 
 export class BiomeSystem {
@@ -263,7 +263,9 @@ export class BiomeSystem {
     canvas.width = resolution
     canvas.height = resolution
     const ctx = canvas.getContext('2d')!
-    ctx.putImageData(new ImageData(rgba, resolution, resolution), 0, 0)
+    const imageData = ctx.createImageData(resolution, resolution)
+    imageData.data.set(rgba)
+    ctx.putImageData(imageData, 0, 0)
     return canvas.toDataURL('image/png')
   }
 }

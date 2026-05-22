@@ -63,6 +63,11 @@ export class UIController {
     blendMargin: 2.5
   }
 
+  private csgParams = {
+    undergroundDepth: 60,
+    runDemo: () => this.runCsgDemo()
+  }
+
   private brushParams = {
     mode: 'raise' as BrushMode,
     size: 10,
@@ -433,6 +438,15 @@ export class UIController {
 
     biomeFolder.add({ exportBiomes: () => this.exportBiomes() }, 'exportBiomes')
       .name('📦 Export Biome Data')
+
+    // CSG (experimental) folder — heightfield → solid + boolean carving
+    const csgFolder = this.gui.addFolder('CSG (experimental)')
+
+    csgFolder.add(this.csgParams, 'undergroundDepth', 0, 300, 5)
+      .name('Underground Depth (m)')
+
+    csgFolder.add(this.csgParams, 'runDemo')
+      .name('🧱 Solidify + Carve (demo)')
 
     // Brush Tools folder
     const brushFolder = this.gui.addFolder('Brush Tools')
@@ -824,6 +838,17 @@ export class UIController {
     } catch (error) {
       console.error('Failed to export biome data:', error)
       alert('Failed to export biome data. Please try again.')
+    }
+  }
+
+  /** Run (or toggle off) the Stage-1 CSG solidify + carve demo. */
+  private runCsgDemo(): void {
+    try {
+      const showing = this.terrainBuilder.runCsgDemo(this.csgParams.undergroundDepth)
+      console.log(showing ? 'CSG demo: showing carved solid' : 'CSG demo: restored terrain')
+    } catch (error) {
+      console.error('CSG demo failed:', error)
+      alert('CSG demo failed — see console for details.')
     }
   }
 

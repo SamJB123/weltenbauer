@@ -6,6 +6,7 @@ import { ErosionSystem, ErosionConfig, AdvancedErosionConfig } from './ErosionSy
 import { TerrainMaterial } from './TerrainMaterial'
 import { ClimateSystem, ClimateFields, ClimateView, TEMPERATURE_DISPLAY_MIN, TEMPERATURE_DISPLAY_MAX } from './ClimateSystem'
 import { BiomeSystem, BiomeField, BIOMES } from './BiomeSystem'
+import { buildSolidGeometry, carveSphere } from './CsgSystem'
 import { TerrainWorkerMessage, TerrainWorkerResponse } from './TerrainWorker'
 
 export interface TerrainConfig {
@@ -87,6 +88,7 @@ export class TerrainBuilder {
   private gridHelper: THREE.GridHelper | null = null
   private waterPlane: THREE.Mesh | null = null
   private lastAvgHeight: number = 0
+  private csgMesh: THREE.Mesh | null = null // Stage-1 CSG demo result (carved solid)
 
   // Cursor sampling
   private hoverRaycaster = new THREE.Raycaster()
@@ -1503,6 +1505,9 @@ export class TerrainBuilder {
   private async createTerrainMesh(heightData: Float32Array): Promise<void> {
     console.log('Creating terrain mesh...')
 
+    // A regenerated terrain invalidates any CSG demo result.
+    this.clearCsgDemo()
+
     // Reshape into an island (borders below sea level) before stats/mesh/brush see it.
     if (this.config.island.enabled) {
       const island = this.config.island
@@ -2145,8 +2150,8 @@ export class TerrainBuilder {
     legendJson: string
     indicesPng: string
     weightsPng: string
-    indicesBin: Uint8Array
-    weightsBin: Float32Array
+    indicesBin: Uint8Array<ArrayBuffer>
+    weightsBin: Float32Array<ArrayBuffer>
   } | null {
     if (!this.biomeField) this.computeBiomeField()
     if (!this.biomeField) return null
@@ -2171,6 +2176,73 @@ export class TerrainBuilder {
       indicesBin: field.topIndices,
       weightsBin: field.topWeights
     }
+  }
+
+  /**
+   * Stage-1 CSG proof of concept: build a watertight solid from the current
+   * heightfield (capped to a modest resolution so the boolean is fast), subtract
+   * a demo sphere to carve a cave, and show the carved result in place of the
+   * terrain. Calling again toggles back to the normal terrain. This is a separate
+   * 3D representation — it does not affect the heightfield or any exports.
+   */
+  public runCsgDemo(undergroundDepth: number = 60): boolean {
+    // Toggle off: remove the carved mesh and restore the terrain.
+    if (this.csgMesh) {
+      this.scene.remove(this.csgMesh)
+      this.csgMesh.geometry.dispose()
+      ;(this.csgMesh.material as THREE.Material).dispose()
+      this.csgMesh = null
+      if (this.terrain) this.terrain.visible = true
+      if (this.waterPlane) this.waterPlane.visible = true
+      return false
+    }
+
+    if (!this.lastHeightData) return false
+
+    // Cap the solid resolution for a responsive proof of concept (revisit later).
+    const cap = 256
+    const res0 = this.config.resolution
+    let data = this.lastHeightData
+    let res = res0
+    if (res0 > cap) {
+      data = this.resampleHeightData(this.lastHeightData, res0, cap)
+      res = cap
+    }
+
+    const size = this.config.size * 1000
+    const seaLevel = this.config.island.enabled ? this.config.island.seaLevel : this.lastMinHeight
+
+    const solidGeometry = buildSolidGeometry(data, res, { size, seaLevel, undergroundDepth })
+
+    // Demo cut: a sphere biting into the terrain a little off-center.
+    const center = new THREE.Vector3(0, seaLevel + (this.lastMaxHeight - seaLevel) * 0.4, size * 0.05)
+    const radius = size * 0.12
+    const carvedGeometry = carveSphere(solidGeometry, center, radius)
+    solidGeometry.dispose()
+
+    const material = new THREE.MeshStandardMaterial({
+      color: 0x9a8c7a,
+      roughness: 1.0,
+      metalness: 0.0,
+      side: THREE.DoubleSide // so the carved cavity interior is visible
+    })
+    const mesh = new THREE.Mesh(carvedGeometry, material)
+    mesh.position.y = this.terrain ? this.terrain.position.y : 0
+    this.scene.add(mesh)
+    this.csgMesh = mesh
+
+    // Hide the heightfield terrain + water while showing the solid.
+    if (this.terrain) this.terrain.visible = false
+    if (this.waterPlane) this.waterPlane.visible = false
+    return true
+  }
+
+  private clearCsgDemo(): void {
+    if (!this.csgMesh) return
+    this.scene.remove(this.csgMesh)
+    this.csgMesh.geometry.dispose()
+    ;(this.csgMesh.material as THREE.Material).dispose()
+    this.csgMesh = null
   }
 
   public randomizeSeed(): void {
@@ -3258,7 +3330,7 @@ export class TerrainBuilder {
 
     try {
       // Start with the original heightmap data
-      let heightData = this.originalHeightmapData.slice()
+      let heightData: Float32Array = this.originalHeightmapData.slice()
       
       // Apply custom layers on top of the heightmap
       if (this.customLayers.length > 1) { // More than just the heightmap layer
