@@ -7,6 +7,8 @@ import { TerrainMaterial } from './TerrainMaterial'
 import { ClimateSystem, ClimateFields, ClimateView, TEMPERATURE_DISPLAY_MIN, TEMPERATURE_DISPLAY_MAX } from './ClimateSystem'
 import { BiomeSystem, BiomeField, BIOMES } from './BiomeSystem'
 import { buildSolidGeometry, carveSphere } from './CsgSystem'
+import { buildMapSet, MapSetExport } from './MapExport'
+import { encodeIslandProject, decodeIslandProject } from './IslandProject'
 import { TerrainWorkerMessage, TerrainWorkerResponse } from './TerrainWorker'
 
 export interface TerrainConfig {
@@ -37,12 +39,12 @@ export interface BiomeConfig {
 export interface ClimateConfig {
   baseTemperature: number    // °C at sea level, mid-map
   latitudeRange: number      // °C spread across the map (north-south)
-  elevationCooling: number   // °C lost from sea level to the highest land
+  lapseRate: number          // °C lost per 1000m of actual height above sea level
   temperatureNoise: number   // °C of random local variation
   humidityBase: number       // 0..1 baseline humidity
   coastalMoisture: number    // 0..1 extra humidity at the shoreline
   coastalFalloff: number     // 0..1 fraction of map over which coastal moisture decays
-  elevationDrying: number    // 0..1 humidity lost with elevation
+  elevationDrying: number    // 0..1 humidity lost per 1000m of actual height above sea level
   rainShadowStrength: number // 0..1 leeward drying behind upwind ridges
   windDirection: number      // prevailing wind, degrees
   humidityNoise: number      // 0..1 random local variation
@@ -140,7 +142,7 @@ export class TerrainBuilder {
     climate: {
       baseTemperature: 22,
       latitudeRange: 12,
-      elevationCooling: 28,
+      lapseRate: 6.5,
       temperatureNoise: 2,
       humidityBase: 0.35,
       coastalMoisture: 0.5,
@@ -1502,14 +1504,15 @@ export class TerrainBuilder {
   /**
    * Create the terrain mesh from height data (with chunked processing for high resolutions)
    */
-  private async createTerrainMesh(heightData: Float32Array): Promise<void> {
+  private async createTerrainMesh(heightData: Float32Array, applyMask: boolean = true): Promise<void> {
     console.log('Creating terrain mesh...')
 
     // A regenerated terrain invalidates any CSG demo result.
     this.clearCsgDemo()
 
     // Reshape into an island (borders below sea level) before stats/mesh/brush see it.
-    if (this.config.island.enabled) {
+    // Skipped when loading a saved project — that heightfield is already final.
+    if (applyMask && this.config.island.enabled) {
       const island = this.config.island
       this.advancedTerrainGenerator.applyIslandMask(heightData, this.config.resolution, {
         seaLevel: island.seaLevel,
@@ -1627,7 +1630,7 @@ export class TerrainBuilder {
         maxLandHeight: this.lastMaxHeight,
         baseTemperature: c.baseTemperature,
         latitudeRange: c.latitudeRange,
-        elevationCooling: c.elevationCooling,
+        lapseRate: c.lapseRate,
         temperatureNoise: c.temperatureNoise,
         humidityBase: c.humidityBase,
         coastalMoisture: c.coastalMoisture,
@@ -2128,17 +2131,6 @@ export class TerrainBuilder {
     )
   }
 
-  public exportProject(): string {
-    const projectData = {
-      config: this.config,
-      heightData: Array.from(this.brushSystem.getHeightData()),
-      seed: this.advancedTerrainGenerator.getSeed(),
-      timestamp: Date.now(),
-      version: '1.0.0'
-    }
-    return JSON.stringify(projectData, null, 2)
-  }
-
   /**
    * Build the exportable biome dataset: a JSON legend (the contract), PNG control
    * maps (top-4 biome ids + weights), and raw binary buffers for lossless use.
@@ -2243,6 +2235,82 @@ export class TerrainBuilder {
     this.csgMesh.geometry.dispose()
     ;(this.csgMesh.material as THREE.Material).dispose()
     this.csgMesh = null
+  }
+
+  /**
+   * Build the standardized, co-registered 2.5D map set (height + temperature +
+   * humidity + biome) plus its JSON manifest. All maps share the display
+   * resolution and row-major indexing so a consumer can sample them at one UV.
+   * Returns null until a terrain has been generated.
+   */
+  public getMapSetExport(): MapSetExport | null {
+    if (!this.lastHeightData) return null
+    if (!this.climateFields) this.computeClimateFields()
+    if (!this.biomeField) this.computeBiomeField()
+    if (!this.climateFields || !this.biomeField) return null
+
+    return buildMapSet({
+      resolution: this.config.resolution,
+      sizeKm: this.config.size,
+      seaLevel: this.config.island.enabled ? this.config.island.seaLevel : this.lastMinHeight,
+      seed: this.advancedTerrainGenerator.getSeed(),
+      height: this.lastHeightData,
+      temperature: this.climateFields.temperature,
+      humidity: this.climateFields.humidity,
+      biome: this.biomeField
+    })
+  }
+
+  /**
+   * Serialize the current island to a lossless, self-contained project string
+   * (full config + seed + exact float32 heightfield, including brush edits).
+   * Returns null if no terrain exists yet.
+   */
+  public exportIslandProject(): string | null {
+    let heightData = this.brushSystem.getHeightData()
+    if (!heightData || heightData.length === 0) heightData = this.lastHeightData ?? new Float32Array(0)
+    if (heightData.length === 0) return null
+
+    const resolution = Math.round(Math.sqrt(heightData.length))
+    return encodeIslandProject(this.config, this.advancedTerrainGenerator.getSeed(), resolution, heightData)
+  }
+
+  /**
+   * Load a previously-exported island project and rebuild it exactly so it can be
+   * modified further. Restores the config and the precise heightfield without
+   * re-applying the island mask (the saved data already includes it + brush edits).
+   */
+  public async loadIslandProject(json: string): Promise<void> {
+    const { config, seed, resolution, heightData } = decodeIslandProject(json)
+
+    // Restore config; merge over defaults so files missing newer fields still load.
+    this.config = { ...this.config, ...(config as Partial<TerrainConfig>) }
+    this.config.resolution = resolution
+
+    // The loaded heightfield is authoritative — clear imported-heightmap/layer state.
+    this.isUsingImportedHeightmap = false
+    this.originalHeightmapData = null
+    this.customLayers = []
+    this.baseLayerWeightOverrides.clear()
+
+    // Keep the generator in sync for any later (re)generation.
+    this.advancedTerrainGenerator.updateConfig({ seed, resolution, size: this.config.size })
+
+    this.disposeTerrainMesh()
+    await this.createTerrainMesh(heightData, false) // false = don't re-apply the island mask
+  }
+
+  /** Remove and dispose the current terrain mesh (shared cleanup for regeneration/load). */
+  private disposeTerrainMesh(): void {
+    if (!this.terrain) return
+    this.scene.remove(this.terrain)
+    this.terrain.geometry?.dispose()
+    if (Array.isArray(this.terrain.material)) {
+      this.terrain.material.forEach((m: THREE.Material) => m.dispose())
+    } else if (this.terrain.material) {
+      (this.terrain.material as THREE.Material).dispose()
+    }
+    this.terrain = null
   }
 
   public randomizeSeed(): void {

@@ -33,12 +33,12 @@ export interface ClimateOptions {
   maxLandHeight: number     // highest terrain height, used to normalize elevation
   baseTemperature: number   // °C at sea level, mid-map
   latitudeRange: number     // °C spread from one edge of the map to the other
-  elevationCooling: number  // °C lost from sea level up to the highest land
+  lapseRate: number         // °C lost per 1000m of ACTUAL height above sea level
   temperatureNoise: number  // °C of random local variation
   humidityBase: number      // 0..1 baseline humidity
   coastalMoisture: number   // 0..1 extra humidity at the shoreline
   coastalFalloff: number    // 0..1 fraction of the map over which coastal moisture decays
-  elevationDrying: number   // 0..1 humidity lost from sea level to the highest land
+  elevationDrying: number   // 0..1 humidity lost per 1000m of ACTUAL height above sea level
   rainShadowStrength: number// 0..1 leeward drying behind upwind ridges
   windDirection: number     // prevailing wind, degrees (0 = +x, 90 = +y)
   humidityNoise: number     // 0..1 random local variation
@@ -85,21 +85,27 @@ export class ClimateSystem {
         const ny = (y / (resolution - 1)) * 2 - 1
         const nxn = (x / (resolution - 1)) * 2 - 1
         const h = heightData[i]
-        const normElev = Math.max(0, Math.min(1, (h - seaLevel) / landRange))
 
         // --- Temperature ---
+        // Cooling keys off ABSOLUTE height above sea level (a real lapse rate), not
+        // the island's own relief — so a flat island stays warm everywhere and only
+        // genuinely tall terrain gets cold peaks, consistently across islands.
+        const heightAboveSea = Math.max(0, h - seaLevel)
         let t = opts.baseTemperature
         t += -ny * (opts.latitudeRange * 0.5) // one edge warmer, the other cooler
-        t -= normElev * opts.elevationCooling
+        t -= heightAboveSea * (opts.lapseRate / 1000)
         t += noise(nxn * 1.5 + 71.0, ny * 1.5 + 71.0) * opts.temperatureNoise
         temperature[i] = t
         if (t < minT) minT = t
         if (t > maxT) maxT = t
 
         // --- Humidity ---
+        // Drying also keys off ABSOLUTE height above sea level (per 1000m), so a
+        // flat island stays humid and only tall terrain dries out — consistent
+        // across islands, matching the temperature lapse rate.
         let hum = opts.humidityBase
         hum += Math.exp(-oceanDist[i] / falloffCells) * opts.coastalMoisture
-        hum -= normElev * opts.elevationDrying
+        hum -= heightAboveSea * (opts.elevationDrying / 1000)
         if (opts.rainShadowStrength > 0) {
           hum -= this.rainShadow(heightData, resolution, x, y, windX, windY, h, landRange) *
             opts.rainShadowStrength

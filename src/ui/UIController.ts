@@ -3,6 +3,16 @@ import { TerrainBuilder, EditorMode } from '../core/TerrainBuilder'
 import { BrushMode } from '../core/BrushSystem'
 import { ClimateView } from '../core/ClimateSystem'
 import { ProgressOverlay } from './ProgressOverlay'
+import { zipSync, Zippable } from 'fflate'
+
+/** Decode a `data:...;base64,...` URL into raw bytes (for zipping canvas PNGs). */
+function dataUrlToBytes(dataUrl: string): Uint8Array {
+  const base64 = dataUrl.slice(dataUrl.indexOf(',') + 1)
+  const binary = atob(base64)
+  const bytes = new Uint8Array(binary.length)
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i)
+  return bytes
+}
 
 export class UIController {
   private terrainBuilder: TerrainBuilder
@@ -40,6 +50,7 @@ export class UIController {
     randomizeSeed: () => this.randomizeSeed(),
     testHighRes: () => this.testHighResolution(),
     importHeightmap: () => this.importHeightmap(),
+    importIsland: () => this.importIsland(),
     resetToNormal: () => this.resetToNormalTerrain()
   }
 
@@ -47,7 +58,7 @@ export class UIController {
     viewMode: 'normal',
     baseTemperature: 22,
     latitudeRange: 12,
-    elevationCooling: 28,
+    lapseRate: 6.5,
     temperatureNoise: 2,
     humidityBase: 0.35,
     coastalMoisture: 0.5,
@@ -87,8 +98,9 @@ export class UIController {
   }
 
   private exportActions = {
-    exportHeightmap: () => this.exportHeightmap(),
-    exportProject: () => this.exportProject()
+    exportMapSet: () => this.exportMapSet(),
+    exportIsland: () => this.exportIsland(),
+    exportHeightmap: () => this.exportHeightmap()
   }
 
 
@@ -282,6 +294,10 @@ export class UIController {
     terrainFolder.add(this.terrainParams, 'importHeightmap')
       .name('📁 Import Heightmap')
 
+    // Import a previously-exported island (lossless) to keep editing
+    terrainFolder.add(this.terrainParams, 'importIsland')
+      .name('📂 Import Island')
+
     // Reset to normal terrain button
     terrainFolder.add(this.terrainParams, 'resetToNormal')
       .name('🔄 Reset to Normal')
@@ -389,8 +405,8 @@ export class UIController {
       .name('Latitude Range (°C)')
       .onChange(() => this.pushClimateConfig())
 
-    climateFolder.add(this.climateParams, 'elevationCooling', 0, 60, 1)
-      .name('Elevation Cooling (°C)')
+    climateFolder.add(this.climateParams, 'lapseRate', 0, 30, 0.5)
+      .name('Lapse Rate (°C/1000m)')
       .onChange(() => this.pushClimateConfig())
 
     climateFolder.add(this.climateParams, 'temperatureNoise', 0, 10, 0.5)
@@ -410,7 +426,7 @@ export class UIController {
       .onChange(() => this.pushClimateConfig())
 
     climateFolder.add(this.climateParams, 'elevationDrying', 0, 1, 0.05)
-      .name('Elevation Drying')
+      .name('Elevation Drying (/1000m)')
       .onChange(() => this.pushClimateConfig())
 
     climateFolder.add(this.climateParams, 'rainShadowStrength', 0, 1, 0.05)
@@ -491,12 +507,15 @@ export class UIController {
 
     // Export folder
     const exportFolder = this.gui.addFolder('Export')
-    
+
+    exportFolder.add(this.exportActions, 'exportMapSet')
+      .name('🗺️ Export Map Set (2.5D)')
+
+    exportFolder.add(this.exportActions, 'exportIsland')
+      .name('💾 Export Island (lossless)')
+
     exportFolder.add(this.exportActions, 'exportHeightmap')
-      .name('Export Heightmap')
-    
-    exportFolder.add(this.exportActions, 'exportProject')
-      .name('Export Project')
+      .name('Export Heightmap (legacy)')
 
     // Guide folder (collapsed by default)
     const guideFolder = this.gui.addFolder('Guide')
@@ -746,7 +765,7 @@ export class UIController {
     this.climateParams.viewMode = config.climate.viewMode
     this.climateParams.baseTemperature = config.climate.baseTemperature
     this.climateParams.latitudeRange = config.climate.latitudeRange
-    this.climateParams.elevationCooling = config.climate.elevationCooling
+    this.climateParams.lapseRate = config.climate.lapseRate
     this.climateParams.temperatureNoise = config.climate.temperatureNoise
     this.climateParams.humidityBase = config.climate.humidityBase
     this.climateParams.coastalMoisture = config.climate.coastalMoisture
@@ -792,7 +811,7 @@ export class UIController {
     this.terrainBuilder.setClimateConfig({
       baseTemperature: this.climateParams.baseTemperature,
       latitudeRange: this.climateParams.latitudeRange,
-      elevationCooling: this.climateParams.elevationCooling,
+      lapseRate: this.climateParams.lapseRate,
       temperatureNoise: this.climateParams.temperatureNoise,
       humidityBase: this.climateParams.humidityBase,
       coastalMoisture: this.climateParams.coastalMoisture,
@@ -894,6 +913,83 @@ export class UIController {
     this.updateGUIDisplay()
   }
 
+  /** Download the standardized 2.5D map set as a single zip: manifest.json + per-map PNG previews + raw .bin. */
+  private exportMapSet(): void {
+    try {
+      const result = this.terrainBuilder.getMapSetExport()
+      if (!result) {
+        alert('Generate terrain before exporting the map set.')
+        return
+      }
+
+      // Collect everything into one archive instead of N separate downloads.
+      const entries: Zippable = {}
+      entries['manifest.json'] = new TextEncoder().encode(result.manifestJson)
+
+      for (const file of result.files) {
+        const bytes = file.dataUrl ? dataUrlToBytes(file.dataUrl) : new Uint8Array(file.bytes!)
+        // PNGs are already compressed — store them; deflate the raw .bin/.json.
+        entries[file.name] = file.name.endsWith('.png') ? [bytes, { level: 0 }] : bytes
+      }
+
+      // Include the lossless project so the zip can be re-imported and edited.
+      const island = this.terrainBuilder.exportIslandProject()
+      if (island) entries['island.weltenbauer.json'] = new TextEncoder().encode(island)
+
+      const zipped = zipSync(entries)
+      const url = URL.createObjectURL(new Blob([zipped.buffer as ArrayBuffer], { type: 'application/zip' }))
+      this.downloadFile(url, 'weltenbauer-mapset.zip')
+      URL.revokeObjectURL(url)
+    } catch (error) {
+      console.error('Failed to export map set:', error)
+      alert('Failed to export map set. See console for details.')
+    }
+  }
+
+  /** Download the lossless, self-contained island project (re-importable). */
+  private exportIsland(): void {
+    try {
+      const json = this.terrainBuilder.exportIslandProject()
+      if (!json) {
+        alert('Generate terrain before exporting the island.')
+        return
+      }
+      const url = URL.createObjectURL(new Blob([json], { type: 'application/json' }))
+      this.downloadFile(url, 'island.weltenbauer.json')
+      URL.revokeObjectURL(url)
+    } catch (error) {
+      console.error('Failed to export island:', error)
+      alert('Failed to export island. See console for details.')
+    }
+  }
+
+  /** Import a previously-exported island project (.weltenbauer.json) and keep editing it. */
+  private importIsland(): void {
+    const input = document.createElement('input')
+    input.type = 'file'
+    input.accept = 'application/json,.json'
+    input.style.display = 'none'
+
+    input.onchange = async (event) => {
+      const file = (event.target as HTMLInputElement).files?.[0]
+      if (!file) return
+      try {
+        const text = await file.text()
+        await this.terrainBuilder.loadIslandProject(text)
+        this.syncUIWithTerrain() // reflect the loaded config in the GUI
+        console.log('✅ Island imported:', file.name)
+      } catch (error) {
+        console.error('❌ Failed to import island:', error)
+        alert('Failed to import island — is this a weltenbauer island file? See console for details.')
+      } finally {
+        document.body.removeChild(input)
+      }
+    }
+
+    document.body.appendChild(input)
+    input.click()
+  }
+
   private exportHeightmap(): void {
     try {
       const dataUrl = this.terrainBuilder.exportHeightmap()
@@ -901,19 +997,6 @@ export class UIController {
     } catch (error) {
       console.error('Failed to export heightmap:', error)
       alert('Failed to export heightmap. Please try again.')
-    }
-  }
-
-  private exportProject(): void {
-    try {
-      const projectData = this.terrainBuilder.exportProject()
-      const blob = new Blob([projectData], { type: 'application/json' })
-      const url = URL.createObjectURL(blob)
-      this.downloadFile(url, 'terrain-project.json')
-      URL.revokeObjectURL(url)
-    } catch (error) {
-      console.error('Failed to export project:', error)
-      alert('Failed to export project. Please try again.')
     }
   }
 

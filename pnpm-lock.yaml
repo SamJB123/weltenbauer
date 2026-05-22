@@ -8,6 +8,9 @@ importers:
 
   .:
     dependencies:
+      fflate:
+        specifier: ^0.8.3
+        version: 0.8.3
       lil-gui:
         specifier: 0.21.0
         version: 0.21.0

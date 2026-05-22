@@ -8,7 +8,9 @@
       "Bash(node -e \"const p=require\\('./package.json'\\); console.log\\(JSON.stringify\\({...p.dependencies,...p.devDependencies},null,2\\)\\)\")",
       "Bash(node -e \"let s='';process.stdin.on\\('data',d=>s+=d\\).on\\('end',\\(\\)=>console.log\\('three', JSON.parse\\(s\\).version\\)\\)\")",
       "Bash(node -e \"const p=require\\('./node_modules/three/package.json'\\); console.log\\(JSON.stringify\\(p.exports['./tsl'],null,2\\)\\)\")",
-      "WebSearch"
+      "WebSearch",
+      "Bash(cd *)",
+      "Bash(xargs grep -l \"DataArrayTexture\\\\|CompressedArrayTexture\\\\|Data3DTexture\\\\|\\\\.depth\\(\")"
     ]
   }
 }
