@@ -90,6 +90,20 @@ export interface AdvancedTerrainConfig {
   layers: TerrainLayer[]
 }
 
+/**
+ * Options for shaping a heightmap into an island whose borders sit below sea level.
+ * All distances are in normalized [-1, 1] map space; heights are in terrain units.
+ */
+export interface IslandMaskOptions {
+  seaLevel: number        // height value that defines the water surface
+  oceanDepth: number      // how far below seaLevel the sea floor sits at the edges
+  landBias: number        // tallest land height above sea level (vertical scale of the island)
+  falloffStart: number    // 0-1 distance from center where land begins to descend
+  falloffEnd: number      // 0-1 distance from center where terrain is fully submerged
+  shape: number           // 0 = round island, 1 = square island that fills the map
+  coastDistortion: number // organic perturbation of the coastline (0 = geometric)
+}
+
 export enum TerrainType {
   CONTINENTAL = 'continental',
   ISLAND_CHAIN = 'island_chain', 
@@ -522,6 +536,72 @@ export class AdvancedTerrainGenerator {
     let height = volcanic * islandMask + coastal * 0.3 + seaLevel + depthVariation
     
     return height
+  }
+
+  /**
+   * Reshape an existing heightmap into an island. The raw noise relief is first
+   * normalized and remapped proportionally into the configured band — the tallest
+   * land sits `landBias` above sea level and the sea floor `oceanDepth` below it —
+   * so the noise amplitude tracks the Land Elevation / Ocean Depth settings instead
+   * of the generator's absolute scale. Everything past the falloff is then sunk
+   * toward the sea floor, and the outermost border is always submerged so every
+   * heightmap edge sits below sea level. Mutates `heightData` in place.
+   */
+  public applyIslandMask(heightData: Float32Array, resolution: number, opts: IslandMaskOptions): void {
+    const seaFloor = opts.seaLevel - opts.oceanDepth
+    const shape = Math.max(0, Math.min(1, opts.shape))
+
+    // First pass: raw relief range, so we can remap it into the land-elevation
+    // band rather than carry the generator's absolute height scale through.
+    let rawMin = Infinity
+    let rawMax = -Infinity
+    for (let i = 0; i < heightData.length; i++) {
+      const v = heightData[i]
+      if (v < rawMin) rawMin = v
+      if (v > rawMax) rawMax = v
+    }
+    const rawRange = rawMax - rawMin
+    const invRange = rawRange > 1e-6 ? 1 / rawRange : 0
+
+    for (let y = 0; y < resolution; y++) {
+      for (let x = 0; x < resolution; x++) {
+        const i = y * resolution + x
+
+        const nx = (x / (resolution - 1)) * 2 - 1
+        const ny = (y / (resolution - 1)) * 2 - 1
+
+        // Blend a radial distance (round island) with a Chebyshev distance
+        // (square island that fills the map) according to `shape`.
+        const radial = Math.sqrt(nx * nx + ny * ny)
+        const square = Math.max(Math.abs(nx), Math.abs(ny))
+        let d = radial * (1 - shape) + square * shape
+
+        // Perturb the coastline so it isn't a perfect geometric shape.
+        if (opts.coastDistortion > 0) {
+          d += this.noiseSystem.perlin(nx * 2.0 + 17.3, ny * 2.0 + 53.1) * opts.coastDistortion
+        }
+
+        // Land mask: 1 in the interior, 0 past the falloff.
+        let mask = 1 - this.smoothstep(opts.falloffStart, opts.falloffEnd, d)
+
+        // Hard guarantee: force the outermost border underwater no matter what the
+        // shape/distortion produced, so all heightmap edges are below sea level.
+        mask *= 1 - this.smoothstep(0.9, 1.0, square)
+
+        // Remap raw relief to [seaLevel, seaLevel + landBias] (landBias = tallest
+        // land above sea), then sink toward the sea floor by the inverse of the mask.
+        const normalized = (heightData[i] - rawMin) * invRange // 0..1 across the relief
+        const land = opts.seaLevel + normalized * opts.landBias
+        heightData[i] = seaFloor + (land - seaFloor) * mask
+      }
+    }
+  }
+
+  /** GLSL-style smoothstep: 0 below edge0, 1 above edge1, smooth Hermite in between. */
+  private smoothstep(edge0: number, edge1: number, x: number): number {
+    if (edge0 === edge1) return x < edge0 ? 0 : 1
+    const t = Math.max(0, Math.min(1, (x - edge0) / (edge1 - edge0)))
+    return t * t * (3 - 2 * t)
   }
 
   private generateMountainRanges(x: number, y: number, featureScale: number): number {

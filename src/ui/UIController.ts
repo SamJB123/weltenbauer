@@ -1,6 +1,7 @@
 import { GUI } from 'lil-gui'
 import { TerrainBuilder, EditorMode } from '../core/TerrainBuilder'
 import { BrushMode } from '../core/BrushSystem'
+import { ClimateView } from '../core/ClimateSystem'
 import { ProgressOverlay } from './ProgressOverlay'
 
 export class UIController {
@@ -11,6 +12,10 @@ export class UIController {
   private noiseLayersFolder: any = null
   private updateTimeout: number | null = null
   private progressOverlay: ProgressOverlay
+  private cursorPanelValues!: { elevation: HTMLSpanElement; temperature: HTMLSpanElement; humidity: HTMLSpanElement; biome: HTMLSpanElement }
+  private isPointerDown = false
+  private pendingCursorEvent: MouseEvent | null = null
+  private cursorRafScheduled = false
 
   // UI state objects for lil-gui
   private terrainParams = {
@@ -22,10 +27,40 @@ export class UIController {
     featureScale: 1.5,
     seed: 123456,
     showGrid: true,
+    // Island & sea level
+    islandEnabled: true,
+    seaLevel: 0,
+    oceanDepth: 25,
+    landElevation: 25,
+    falloffStart: 0.45,
+    falloffEnd: 0.92,
+    islandShape: 0.15,
+    coastDistortion: 0.1,
+    showWater: true,
     randomizeSeed: () => this.randomizeSeed(),
     testHighRes: () => this.testHighResolution(),
     importHeightmap: () => this.importHeightmap(),
     resetToNormal: () => this.resetToNormalTerrain()
+  }
+
+  private climateParams = {
+    viewMode: 'normal',
+    baseTemperature: 22,
+    latitudeRange: 12,
+    elevationCooling: 28,
+    temperatureNoise: 2,
+    humidityBase: 0.35,
+    coastalMoisture: 0.5,
+    coastalFalloff: 0.25,
+    elevationDrying: 0.35,
+    rainShadowStrength: 0.4,
+    windDirection: 270,
+    humidityNoise: 0.12
+  }
+
+  private biomeParams = {
+    beachHeight: 12,
+    blendMargin: 2.5
   }
 
   private brushParams = {
@@ -69,8 +104,95 @@ export class UIController {
     
     this.setupModeToggle()
     this.setupGUI()
+    this.setupCursorPanel()
     this.setupCanvasEvents()
     this.syncUIWithTerrain()
+  }
+
+  /** Bottom-left readout of elevation/temperature/humidity under the cursor. */
+  private setupCursorPanel(): void {
+    const panel = document.createElement('div')
+    panel.style.position = 'absolute'
+    panel.style.bottom = '10px'
+    panel.style.left = '10px'
+    panel.style.zIndex = '1000'
+    panel.style.minWidth = '180px'
+    panel.style.padding = '12px 14px'
+    panel.style.background = 'rgba(26, 26, 26, 0.9)'
+    panel.style.border = '2px solid #555'
+    panel.style.borderRadius = '10px'
+    panel.style.backdropFilter = 'blur(10px)'
+    panel.style.boxShadow = '0 8px 32px rgba(0, 0, 0, 0.4)'
+    panel.style.color = '#eee'
+    panel.style.fontFamily = 'system-ui, -apple-system, sans-serif'
+    panel.style.fontSize = '13px'
+    panel.style.pointerEvents = 'none' // never intercept terrain mouse events
+
+    const title = document.createElement('div')
+    title.textContent = 'At Cursor'
+    title.style.fontWeight = '600'
+    title.style.fontSize = '12px'
+    title.style.textTransform = 'uppercase'
+    title.style.letterSpacing = '0.05em'
+    title.style.color = '#9ab'
+    title.style.marginBottom = '8px'
+    panel.appendChild(title)
+
+    const makeRow = (label: string): HTMLSpanElement => {
+      const row = document.createElement('div')
+      row.style.display = 'flex'
+      row.style.justifyContent = 'space-between'
+      row.style.gap = '16px'
+      row.style.lineHeight = '1.6'
+
+      const name = document.createElement('span')
+      name.textContent = label
+      name.style.color = '#aaa'
+
+      const value = document.createElement('span')
+      value.textContent = '—'
+      value.style.fontVariantNumeric = 'tabular-nums'
+      value.style.fontWeight = '500'
+
+      row.appendChild(name)
+      row.appendChild(value)
+      panel.appendChild(row)
+      return value
+    }
+
+    this.cursorPanelValues = {
+      elevation: makeRow('Elevation'),
+      temperature: makeRow('Temperature'),
+      humidity: makeRow('Humidity'),
+      biome: makeRow('Biome')
+    }
+
+    document.body.appendChild(panel)
+  }
+
+  /** Update the cursor readout from a mouse event, or blank it when off-terrain. */
+  private updateCursorPanel(event: MouseEvent): void {
+    const rect = this.canvas.getBoundingClientRect()
+    const ndcX = ((event.clientX - rect.left) / rect.width) * 2 - 1
+    const ndcY = -((event.clientY - rect.top) / rect.height) * 2 + 1
+
+    const sample = this.terrainBuilder.sampleAtNDC(ndcX, ndcY)
+    const v = this.cursorPanelValues
+
+    if (!sample) {
+      v.elevation.textContent = '—'
+      v.temperature.textContent = '—'
+      v.humidity.textContent = '—'
+      v.biome.textContent = '—'
+      return
+    }
+
+    const relative = sample.elevation - sample.seaLevel
+    const suffix = sample.underwater ? ' (underwater)' : ''
+    v.elevation.textContent = `${relative.toFixed(0)} m${suffix}`
+    v.temperature.textContent = sample.temperature === null ? '—' : `${sample.temperature.toFixed(1)} °C`
+    v.humidity.textContent = sample.humidity === null ? '—' : `${Math.round(sample.humidity * 100)} %`
+    v.biome.textContent = sample.biome ?? '—'
   }
 
   private setupModeToggle(): void {
@@ -199,6 +321,118 @@ export class UIController {
       })
 
     terrainFolder.open()
+
+    // Island & Sea Level folder
+    const islandFolder = this.gui.addFolder('Island & Sea Level')
+
+    islandFolder.add(this.terrainParams, 'islandEnabled')
+      .name('🏝️ Islandize')
+      .onChange(() => this.pushIslandConfig())
+
+    islandFolder.add(this.terrainParams, 'seaLevel', -200, 200, 1)
+      .name('Sea Level')
+      .onChange(() => this.pushIslandConfig())
+
+    islandFolder.add(this.terrainParams, 'oceanDepth', 0, 500, 5)
+      .name('Ocean Depth')
+      .onChange(() => this.pushIslandConfig())
+
+    islandFolder.add(this.terrainParams, 'landElevation', 0, 400, 1)
+      .name('Land Elevation (peak m)')
+      .onChange(() => this.pushIslandConfig())
+
+    islandFolder.add(this.terrainParams, 'falloffStart', 0.0, 1.0, 0.01)
+      .name('Coast Start')
+      .onChange(() => this.pushIslandConfig())
+
+    islandFolder.add(this.terrainParams, 'falloffEnd', 0.0, 1.0, 0.01)
+      .name('Coast End')
+      .onChange(() => this.pushIslandConfig())
+
+    islandFolder.add(this.terrainParams, 'islandShape', 0.0, 1.0, 0.05)
+      .name('Shape (round→square)')
+      .onChange(() => this.pushIslandConfig())
+
+    islandFolder.add(this.terrainParams, 'coastDistortion', 0.0, 0.5, 0.01)
+      .name('Coast Distortion')
+      .onChange(() => this.pushIslandConfig())
+
+    islandFolder.add(this.terrainParams, 'showWater')
+      .name('Show Water')
+      .onChange(() => this.pushIslandConfig())
+
+    islandFolder.open()
+
+    // Climate folder (temperature + humidity)
+    const climateFolder = this.gui.addFolder('Climate')
+
+    climateFolder.add(this.climateParams, 'viewMode', {
+      'Normal (textured)': 'normal',
+      'Biome (textured)': 'biome',
+      'Biome colors': 'biomeColor',
+      'Temperature map': 'temperature',
+      'Humidity map': 'humidity'
+    })
+      .name('🌡️ View')
+      .onChange((value: ClimateView) => this.terrainBuilder.setClimateViewMode(value))
+
+    climateFolder.add(this.climateParams, 'baseTemperature', -20, 40, 1)
+      .name('Base Temp (°C)')
+      .onChange(() => this.pushClimateConfig())
+
+    climateFolder.add(this.climateParams, 'latitudeRange', 0, 40, 1)
+      .name('Latitude Range (°C)')
+      .onChange(() => this.pushClimateConfig())
+
+    climateFolder.add(this.climateParams, 'elevationCooling', 0, 60, 1)
+      .name('Elevation Cooling (°C)')
+      .onChange(() => this.pushClimateConfig())
+
+    climateFolder.add(this.climateParams, 'temperatureNoise', 0, 10, 0.5)
+      .name('Temp Variation (°C)')
+      .onChange(() => this.pushClimateConfig())
+
+    climateFolder.add(this.climateParams, 'humidityBase', 0, 1, 0.05)
+      .name('Base Humidity')
+      .onChange(() => this.pushClimateConfig())
+
+    climateFolder.add(this.climateParams, 'coastalMoisture', 0, 1, 0.05)
+      .name('Coastal Moisture')
+      .onChange(() => this.pushClimateConfig())
+
+    climateFolder.add(this.climateParams, 'coastalFalloff', 0.02, 1, 0.02)
+      .name('Coastal Reach')
+      .onChange(() => this.pushClimateConfig())
+
+    climateFolder.add(this.climateParams, 'elevationDrying', 0, 1, 0.05)
+      .name('Elevation Drying')
+      .onChange(() => this.pushClimateConfig())
+
+    climateFolder.add(this.climateParams, 'rainShadowStrength', 0, 1, 0.05)
+      .name('Rain Shadow')
+      .onChange(() => this.pushClimateConfig())
+
+    climateFolder.add(this.climateParams, 'windDirection', 0, 360, 5)
+      .name('Wind Direction (°)')
+      .onChange(() => this.pushClimateConfig())
+
+    climateFolder.add(this.climateParams, 'humidityNoise', 0, 0.5, 0.02)
+      .name('Humidity Variation')
+      .onChange(() => this.pushClimateConfig())
+
+    // Biome folder (Whittaker classification)
+    const biomeFolder = this.gui.addFolder('Biomes')
+
+    biomeFolder.add(this.biomeParams, 'beachHeight', 0, 60, 1)
+      .name('Beach Height')
+      .onChange(() => this.pushBiomeConfig())
+
+    biomeFolder.add(this.biomeParams, 'blendMargin', 0.5, 8, 0.5)
+      .name('Blend Width (°C)')
+      .onChange(() => this.pushBiomeConfig())
+
+    biomeFolder.add({ exportBiomes: () => this.exportBiomes() }, 'exportBiomes')
+      .name('📦 Export Biome Data')
 
     // Brush Tools folder
     const brushFolder = this.gui.addFolder('Brush Tools')
@@ -421,6 +655,7 @@ export class UIController {
 
   private setupCanvasEvents(): void {
     this.canvas.addEventListener('mousedown', (event) => {
+      this.isPointerDown = true
       this.terrainBuilder.getBrushSystem().handleMouseDown(
         event,
         this.terrainBuilder.getCamera(),
@@ -434,10 +669,38 @@ export class UIController {
         this.terrainBuilder.getCamera(),
         this.canvas
       )
+      this.scheduleCursorUpdate(event)
     })
 
-    this.canvas.addEventListener('mouseup', () => {
+    this.canvas.addEventListener('mouseup', (event) => {
+      this.isPointerDown = false
       this.terrainBuilder.getBrushSystem().handleMouseUp()
+      this.scheduleCursorUpdate(event) // refresh once after the drag ends
+    })
+
+    // Catch releases outside the canvas so the pointer-down state can't get stuck.
+    window.addEventListener('mouseup', () => {
+      this.isPointerDown = false
+    })
+  }
+
+  /**
+   * Throttle cursor sampling to at most one raycast per animation frame, and skip
+   * it entirely while dragging (orbit/brush) — raycasting the high-res terrain on
+   * every mousemove during a rotate is what tanks the frame rate.
+   */
+  private scheduleCursorUpdate(event: MouseEvent): void {
+    this.pendingCursorEvent = event
+    if (this.cursorRafScheduled) return
+
+    this.cursorRafScheduled = true
+    requestAnimationFrame(() => {
+      this.cursorRafScheduled = false
+      const pending = this.pendingCursorEvent
+      this.pendingCursorEvent = null
+      if (pending && !this.isPointerDown) {
+        this.updateCursorPanel(pending)
+      }
     })
   }
 
@@ -454,6 +717,35 @@ export class UIController {
     this.terrainParams.seed = config.seed
     this.terrainParams.showGrid = this.terrainBuilder.isGridVisible()
 
+    // Island & sea level
+    this.terrainParams.islandEnabled = config.island.enabled
+    this.terrainParams.seaLevel = config.island.seaLevel
+    this.terrainParams.oceanDepth = config.island.oceanDepth
+    this.terrainParams.landElevation = config.island.landBias
+    this.terrainParams.falloffStart = config.island.falloffStart
+    this.terrainParams.falloffEnd = config.island.falloffEnd
+    this.terrainParams.islandShape = config.island.shape
+    this.terrainParams.coastDistortion = config.island.coastDistortion
+    this.terrainParams.showWater = config.island.showWater
+
+    // Climate
+    this.climateParams.viewMode = config.climate.viewMode
+    this.climateParams.baseTemperature = config.climate.baseTemperature
+    this.climateParams.latitudeRange = config.climate.latitudeRange
+    this.climateParams.elevationCooling = config.climate.elevationCooling
+    this.climateParams.temperatureNoise = config.climate.temperatureNoise
+    this.climateParams.humidityBase = config.climate.humidityBase
+    this.climateParams.coastalMoisture = config.climate.coastalMoisture
+    this.climateParams.coastalFalloff = config.climate.coastalFalloff
+    this.climateParams.elevationDrying = config.climate.elevationDrying
+    this.climateParams.rainShadowStrength = config.climate.rainShadowStrength
+    this.climateParams.windDirection = config.climate.windDirection
+    this.climateParams.humidityNoise = config.climate.humidityNoise
+
+    // Biomes
+    this.biomeParams.beachHeight = config.biome.beachHeight
+    this.biomeParams.blendMargin = config.biome.blendMargin
+
     // Update brush params
     const brushSettings = this.terrainBuilder.getBrushSystem().getBrushSettings()
     this.brushParams.mode = brushSettings.mode
@@ -462,6 +754,77 @@ export class UIController {
 
     // Refresh GUI to show updated values
     this.updateGUIDisplay()
+  }
+
+  /** Send the current island/sea-level params to the terrain builder as one config update. */
+  private pushIslandConfig(): void {
+    this.terrainBuilder.updateConfig({
+      island: {
+        enabled: this.terrainParams.islandEnabled,
+        seaLevel: this.terrainParams.seaLevel,
+        oceanDepth: this.terrainParams.oceanDepth,
+        landBias: this.terrainParams.landElevation,
+        falloffStart: this.terrainParams.falloffStart,
+        falloffEnd: this.terrainParams.falloffEnd,
+        shape: this.terrainParams.islandShape,
+        coastDistortion: this.terrainParams.coastDistortion,
+        showWater: this.terrainParams.showWater
+      }
+    })
+  }
+
+  /** Send the current climate params to the terrain builder (no terrain regeneration). */
+  private pushClimateConfig(): void {
+    this.terrainBuilder.setClimateConfig({
+      baseTemperature: this.climateParams.baseTemperature,
+      latitudeRange: this.climateParams.latitudeRange,
+      elevationCooling: this.climateParams.elevationCooling,
+      temperatureNoise: this.climateParams.temperatureNoise,
+      humidityBase: this.climateParams.humidityBase,
+      coastalMoisture: this.climateParams.coastalMoisture,
+      coastalFalloff: this.climateParams.coastalFalloff,
+      elevationDrying: this.climateParams.elevationDrying,
+      rainShadowStrength: this.climateParams.rainShadowStrength,
+      windDirection: this.climateParams.windDirection,
+      humidityNoise: this.climateParams.humidityNoise
+    })
+  }
+
+  /** Send the current biome params to the terrain builder (no terrain regeneration). */
+  private pushBiomeConfig(): void {
+    this.terrainBuilder.setBiomeConfig({
+      beachHeight: this.biomeParams.beachHeight,
+      blendMargin: this.biomeParams.blendMargin
+    })
+  }
+
+  /** Download the texture-agnostic biome dataset: legend JSON, PNG control maps, raw binary. */
+  private exportBiomes(): void {
+    try {
+      const data = this.terrainBuilder.getBiomeExport()
+      if (!data) {
+        alert('Generate terrain before exporting biome data.')
+        return
+      }
+
+      const jsonUrl = URL.createObjectURL(new Blob([data.legendJson], { type: 'application/json' }))
+      this.downloadFile(jsonUrl, 'biomes-legend.json')
+      URL.revokeObjectURL(jsonUrl)
+
+      this.downloadFile(data.indicesPng, 'biome-indices.png')
+      this.downloadFile(data.weightsPng, 'biome-weights.png')
+
+      const idxUrl = URL.createObjectURL(new Blob([data.indicesBin], { type: 'application/octet-stream' }))
+      this.downloadFile(idxUrl, 'biome-indices.bin')
+      URL.revokeObjectURL(idxUrl)
+
+      const wUrl = URL.createObjectURL(new Blob([data.weightsBin.buffer], { type: 'application/octet-stream' }))
+      this.downloadFile(wUrl, 'biome-weights.bin')
+      URL.revokeObjectURL(wUrl)
+    } catch (error) {
+      console.error('Failed to export biome data:', error)
+      alert('Failed to export biome data. Please try again.')
+    }
   }
 
   private randomizeSeed(): void {

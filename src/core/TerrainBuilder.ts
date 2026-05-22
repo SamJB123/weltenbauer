@@ -4,6 +4,8 @@ import { AdvancedTerrainGenerator, TerrainType } from './AdvancedTerrainGenerato
 import { BrushSystem } from './BrushSystem'
 import { ErosionSystem, ErosionConfig, AdvancedErosionConfig } from './ErosionSystem'
 import { TerrainMaterial } from './TerrainMaterial'
+import { ClimateSystem, ClimateFields, ClimateView, TEMPERATURE_DISPLAY_MIN, TEMPERATURE_DISPLAY_MAX } from './ClimateSystem'
+import { BiomeSystem, BiomeField, BIOMES } from './BiomeSystem'
 import { TerrainWorkerMessage, TerrainWorkerResponse } from './TerrainWorker'
 
 export interface TerrainConfig {
@@ -18,9 +20,57 @@ export interface TerrainConfig {
   terrainType: TerrainType
   // Advanced mode settings
   advancedMode: boolean
+  // Island shaping + sea level
+  island: IslandConfig
+  // Climate fields (temperature + humidity)
+  climate: ClimateConfig
+  // Biome classification
+  biome: BiomeConfig
+}
+
+export interface BiomeConfig {
+  beachHeight: number  // height band above sea level classified as beach
+  blendMargin: number  // °C of soft overlap between biome bands (controls blend width)
+}
+
+export interface ClimateConfig {
+  baseTemperature: number    // °C at sea level, mid-map
+  latitudeRange: number      // °C spread across the map (north-south)
+  elevationCooling: number   // °C lost from sea level to the highest land
+  temperatureNoise: number   // °C of random local variation
+  humidityBase: number       // 0..1 baseline humidity
+  coastalMoisture: number    // 0..1 extra humidity at the shoreline
+  coastalFalloff: number     // 0..1 fraction of map over which coastal moisture decays
+  elevationDrying: number    // 0..1 humidity lost with elevation
+  rainShadowStrength: number // 0..1 leeward drying behind upwind ridges
+  windDirection: number      // prevailing wind, degrees
+  humidityNoise: number      // 0..1 random local variation
+  viewMode: ClimateView      // 'normal' | 'temperature' | 'humidity'
+}
+
+export interface IslandConfig {
+  enabled: boolean         // reshape the heightmap into an island
+  seaLevel: number         // height value of the water surface
+  oceanDepth: number       // depth of the sea floor below seaLevel at the edges
+  landBias: number         // tallest land height above sea level (vertical scale of the island)
+  falloffStart: number     // 0-1 distance from center where the coast begins to descend
+  falloffEnd: number       // 0-1 distance from center where terrain is fully submerged
+  shape: number            // 0 = round island, 1 = square island filling the map
+  coastDistortion: number  // organic perturbation of the coastline
+  showWater: boolean       // render a translucent water plane at seaLevel
 }
 
 export type EditorMode = 'orbit' | 'brush'
+
+/** A point-sample of the terrain under the cursor. */
+export interface TerrainSample {
+  elevation: number            // raw terrain height at the cell
+  temperature: number | null   // °C, null if climate not yet available
+  humidity: number | null      // 0..1, null if climate not yet available
+  biome: string | null         // dominant biome name, null if not yet available
+  seaLevel: number             // current water surface height
+  underwater: boolean          // elevation is below sea level (island mode)
+}
 
 export class TerrainBuilder {
   private canvas: HTMLCanvasElement
@@ -35,7 +85,20 @@ export class TerrainBuilder {
   private brushSystem: BrushSystem
   private erosionSystem: ErosionSystem
   private gridHelper: THREE.GridHelper | null = null
-  
+  private waterPlane: THREE.Mesh | null = null
+  private lastAvgHeight: number = 0
+
+  // Cursor sampling
+  private hoverRaycaster = new THREE.Raycaster()
+
+  // Climate visualization state
+  private climateFields: ClimateFields | null = null
+  private biomeField: BiomeField | null = null
+  private climateDebugMaterial: THREE.MeshStandardMaterial | null = null
+  private lastHeightData: Float32Array | null = null
+  private lastMinHeight: number = 0
+  private lastMaxHeight: number = 0
+
   private mode: EditorMode = 'orbit'
   private noisePreviewCanvas: HTMLCanvasElement
   private noiseLayersContainer: HTMLDivElement
@@ -58,7 +121,39 @@ export class TerrainBuilder {
     featureScale: 1.5,
     terrainType: TerrainType.CONTINENTAL,
     // Advanced mode settings
-    advancedMode: true
+    advancedMode: true,
+    // Island shaping + sea level
+    island: {
+      enabled: true,
+      seaLevel: 0,
+      oceanDepth: 25,
+      landBias: 25,
+      falloffStart: 0.45,
+      falloffEnd: 0.92,
+      shape: 0.15,
+      coastDistortion: 0.1,
+      showWater: true
+    },
+    // Climate fields (temperature + humidity)
+    climate: {
+      baseTemperature: 22,
+      latitudeRange: 12,
+      elevationCooling: 28,
+      temperatureNoise: 2,
+      humidityBase: 0.35,
+      coastalMoisture: 0.5,
+      coastalFalloff: 0.25,
+      elevationDrying: 0.35,
+      rainShadowStrength: 0.4,
+      windDirection: 270,
+      humidityNoise: 0.12,
+      viewMode: 'normal'
+    },
+    // Biome classification
+    biome: {
+      beachHeight: 12,
+      blendMargin: 2.5
+    }
   }
 
   private updateTimeout: number | null = null
@@ -1408,6 +1503,20 @@ export class TerrainBuilder {
   private async createTerrainMesh(heightData: Float32Array): Promise<void> {
     console.log('Creating terrain mesh...')
 
+    // Reshape into an island (borders below sea level) before stats/mesh/brush see it.
+    if (this.config.island.enabled) {
+      const island = this.config.island
+      this.advancedTerrainGenerator.applyIslandMask(heightData, this.config.resolution, {
+        seaLevel: island.seaLevel,
+        oceanDepth: island.oceanDepth,
+        landBias: island.landBias,
+        falloffStart: island.falloffStart,
+        falloffEnd: island.falloffEnd,
+        shape: island.shape,
+        coastDistortion: island.coastDistortion
+      })
+    }
+
     // Create terrain geometry
     const geometry = new THREE.PlaneGeometry(
       this.config.size * 1000,
@@ -1415,6 +1524,18 @@ export class TerrainBuilder {
       this.config.resolution - 1,
       this.config.resolution - 1
     )
+
+    // Default biome attributes so the biome-aware TSL material always compiles
+    // (overwritten with real data when a biome view is active). soil=1, white tint.
+    const vertexCount = this.config.resolution * this.config.resolution
+    const defaultSurface = new Float32Array(vertexCount * 4)
+    const defaultTint = new Float32Array(vertexCount * 3)
+    for (let i = 0; i < vertexCount; i++) {
+      defaultSurface[i * 4] = 1 // soil channel
+      defaultTint[i * 3] = 1; defaultTint[i * 3 + 1] = 1; defaultTint[i * 3 + 2] = 1
+    }
+    geometry.setAttribute('surfaceWeight', new THREE.BufferAttribute(defaultSurface, 4))
+    geometry.setAttribute('biomeTint', new THREE.BufferAttribute(defaultTint, 3))
 
     // Apply height data to vertices in chunks to prevent stack overflow
     await this.applyHeightDataToVertices(geometry, heightData)
@@ -1431,7 +1552,14 @@ export class TerrainBuilder {
     // Calculate min/max height using loop instead of spread operator to prevent stack overflow
     const { minHeight, maxHeight, avgHeight } = this.calculateHeightStats(heightData)
     console.log(`Height range: ${minHeight.toFixed(2)} to ${maxHeight.toFixed(2)}, avg: ${avgHeight.toFixed(2)}`)
-    
+
+    // Cache inputs for climate computation; invalidate any stale climate fields.
+    this.lastHeightData = heightData
+    this.lastMinHeight = minHeight
+    this.lastMaxHeight = maxHeight
+    this.climateFields = null
+    this.biomeField = null
+
     this.terrainMaterial.updateHeightRange(minHeight, maxHeight)
 
     // Get the material
@@ -1453,6 +1581,10 @@ export class TerrainBuilder {
       this.gridHelper.position.y = -avgHeight * 0.5 - 0.1 // Slightly below terrain center
     }
 
+    // Add/refresh the water plane at sea level (terrain is recentered by -avgHeight*0.5)
+    this.lastAvgHeight = avgHeight
+    this.updateWaterPlane()
+
     // Update brush system
     this.brushSystem.setTerrain(this.terrain, heightData, this.config.resolution)
     
@@ -1463,8 +1595,206 @@ export class TerrainBuilder {
     if (this.uiController) {
       this.updateNoiseLayersGUI()
     }
-    
+
+    // Honor the current climate view mode (recolors the mesh if not 'normal').
+    this.applyViewMode()
+
     console.log('Terrain mesh created successfully!')
+  }
+
+  /**
+   * Recompute the cached temperature/humidity fields from the most recent
+   * heightmap. No-op until a terrain has been generated.
+   */
+  private computeClimateFields(): void {
+    if (!this.lastHeightData) return
+
+    const c = this.config.climate
+    const seaLevel = this.config.island.enabled ? this.config.island.seaLevel : this.lastMinHeight
+    const noise = (x: number, y: number) =>
+      this.advancedTerrainGenerator.getNoiseSystem().perlin(x, y)
+
+    this.climateFields = ClimateSystem.compute(
+      this.lastHeightData,
+      this.config.resolution,
+      {
+        seaLevel,
+        maxLandHeight: this.lastMaxHeight,
+        baseTemperature: c.baseTemperature,
+        latitudeRange: c.latitudeRange,
+        elevationCooling: c.elevationCooling,
+        temperatureNoise: c.temperatureNoise,
+        humidityBase: c.humidityBase,
+        coastalMoisture: c.coastalMoisture,
+        coastalFalloff: c.coastalFalloff,
+        elevationDrying: c.elevationDrying,
+        rainShadowStrength: c.rainShadowStrength,
+        windDirection: c.windDirection,
+        humidityNoise: c.humidityNoise
+      },
+      noise
+    )
+
+    const r = this.climateFields.temperatureRange
+    console.log(
+      `Climate: temperature ${r.min.toFixed(1)}°C to ${r.max.toFixed(1)}°C ` +
+      `(color scale ${TEMPERATURE_DISPLAY_MIN}°C→${TEMPERATURE_DISPLAY_MAX}°C)`
+    )
+  }
+
+  /**
+   * Apply the current view mode to the existing terrain mesh:
+   *  - 'normal'      : the height/slope textured material.
+   *  - 'biome'       : biome-driven texturing via the same TSL material (dogfood).
+   *  - 'temperature' / 'humidity' / 'biomeColor' : flat color maps via a lit
+   *    vertex-color debug material.
+   * Cheap enough to call on its own when only the view or params change.
+   */
+  private applyViewMode(): void {
+    if (!this.terrain) return
+
+    const geometry = this.terrain.geometry as THREE.BufferGeometry
+    const mode = this.config.climate.viewMode
+
+    // Biome texturing reuses the terrain material, driven by per-vertex biome data.
+    if (mode === 'biome') {
+      if (!this.biomeField) this.computeBiomeField()
+      if (this.biomeField) {
+        geometry.setAttribute('surfaceWeight', new THREE.BufferAttribute(BiomeSystem.surfaceWeights(this.biomeField), 4))
+        geometry.setAttribute('biomeTint', new THREE.BufferAttribute(BiomeSystem.paletteColors(this.biomeField), 3))
+        this.terrainMaterial.setBiomeBlend(1)
+        this.terrain.material = this.terrainMaterial.getMaterial()
+        return
+      }
+    }
+
+    // All other modes use the height/slope material in its normal (non-biome) state.
+    this.terrainMaterial.setBiomeBlend(0)
+
+    if (mode === 'normal') {
+      this.terrain.material = this.terrainMaterial.getMaterial()
+      return
+    }
+
+    // Flat color maps (temperature / humidity / biome palette) via vertex colors.
+    let colors: Float32Array | null = null
+    if (mode === 'biomeColor') {
+      if (!this.biomeField) this.computeBiomeField()
+      if (this.biomeField) colors = BiomeSystem.paletteColors(this.biomeField)
+    } else {
+      if (!this.climateFields) this.computeClimateFields()
+      if (this.climateFields) {
+        const field = mode === 'temperature' ? this.climateFields.temperature : this.climateFields.humidity
+        // Fixed absolute scales (°C thermometer / 0..1 humidity) so colors mean
+        // real values; rescaling temperature to its own min/max would hide
+        // baseTemperature and always paint a full blue→red spread.
+        const range = mode === 'temperature'
+          ? { min: TEMPERATURE_DISPLAY_MIN, max: TEMPERATURE_DISPLAY_MAX }
+          : { min: 0, max: 1 }
+        colors = ClimateSystem.fieldToColors(field, mode, range)
+      }
+    }
+    if (!colors) return
+
+    geometry.setAttribute('color', new THREE.BufferAttribute(colors, 3))
+    if (!this.climateDebugMaterial) {
+      this.climateDebugMaterial = new THREE.MeshStandardMaterial({
+        vertexColors: true,
+        roughness: 1.0,
+        metalness: 0.0
+      })
+    }
+    this.terrain.material = this.climateDebugMaterial
+  }
+
+  /** Recompute the cached biome field from the current heightmap + climate. */
+  private computeBiomeField(): void {
+    if (!this.lastHeightData) return
+    if (!this.climateFields) this.computeClimateFields()
+    if (!this.climateFields) return
+
+    const seaLevel = this.config.island.enabled ? this.config.island.seaLevel : this.lastMinHeight
+    this.biomeField = BiomeSystem.compute(
+      this.lastHeightData,
+      this.climateFields,
+      this.config.resolution,
+      {
+        seaLevel,
+        beachHeight: this.config.biome.beachHeight,
+        blendMargin: this.config.biome.blendMargin
+      }
+    )
+  }
+
+  /**
+   * Switch the terrain view between the textured 'normal' look and the
+   * temperature/humidity climate maps. Does not regenerate terrain.
+   */
+  public setClimateViewMode(mode: ClimateView): void {
+    this.config.climate.viewMode = mode
+    this.applyViewMode()
+  }
+
+  /**
+   * Update climate parameters and refresh the climate view without regenerating
+   * terrain (climate is derived from the existing heightmap). Recomputation only
+   * happens when a climate map is actually being viewed.
+   */
+  public setClimateConfig(partial: Partial<ClimateConfig>): void {
+    this.config.climate = { ...this.config.climate, ...partial }
+    this.climateFields = null
+    this.biomeField = null // biomes derive from climate
+    this.applyViewMode()
+  }
+
+  /**
+   * Update biome classification parameters and refresh the view without
+   * regenerating terrain (biomes derive from the cached heightmap + climate).
+   */
+  public setBiomeConfig(partial: Partial<BiomeConfig>): void {
+    this.config.biome = { ...this.config.biome, ...partial }
+    this.biomeField = null
+    this.applyViewMode()
+  }
+
+  /**
+   * Create or remove the translucent water plane that visualizes sea level.
+   * Positioned in world space to match the terrain's recentering offset so the
+   * waterline lines up with the masked coastline. Lightweight enough to rebuild
+   * on its own (e.g. when only the water toggle or sea level changes).
+   */
+  private updateWaterPlane(): void {
+    // Dispose any existing plane first.
+    if (this.waterPlane) {
+      this.scene.remove(this.waterPlane)
+      this.waterPlane.geometry.dispose()
+      ;(this.waterPlane.material as THREE.Material).dispose()
+      this.waterPlane = null
+    }
+
+    if (!this.config.island.enabled || !this.config.island.showWater) {
+      return
+    }
+
+    const size = this.config.size * 1000
+    const geometry = new THREE.PlaneGeometry(size, size)
+    const material = new THREE.MeshStandardMaterial({
+      color: 0x1f6dde,
+      transparent: true,
+      opacity: 0.6,
+      roughness: 0.1,
+      metalness: 0.0
+    })
+
+    const plane = new THREE.Mesh(geometry, material)
+    plane.rotation.x = -Math.PI / 2
+    // Terrain heights are recentered by -avgHeight*0.5, so the water surface
+    // (at island.seaLevel in height units) lands at the same world offset.
+    plane.position.y = this.config.island.seaLevel - this.lastAvgHeight * 0.5
+    plane.receiveShadow = false
+    plane.castShadow = false
+    this.scene.add(plane)
+    this.waterPlane = plane
   }
 
   /**
@@ -1739,6 +2069,44 @@ export class TerrainBuilder {
     return this.camera
   }
 
+  /**
+   * Sample the terrain under a normalized-device-coordinate point (x,y in [-1,1],
+   * as produced from a mouse position). Returns elevation plus the temperature and
+   * humidity at that cell, or null if the cursor isn't over the terrain. Climate
+   * fields are computed on demand and cached, so this works in any view mode.
+   */
+  public sampleAtNDC(ndcX: number, ndcY: number): TerrainSample | null {
+    if (!this.terrain || !this.lastHeightData) return null
+
+    this.hoverRaycaster.setFromCamera(new THREE.Vector2(ndcX, ndcY), this.camera)
+    const intersects = this.hoverRaycaster.intersectObject(this.terrain)
+    if (intersects.length === 0) return null
+
+    // World position -> heightmap cell (same convention as BrushSystem).
+    const terrainSize = this.config.size * 1000
+    const halfSize = terrainSize / 2
+    const res = this.config.resolution
+    const p = intersects[0].point
+    const hmapX = Math.floor(((p.x + halfSize) / terrainSize) * res)
+    const hmapZ = Math.floor(((p.z + halfSize) / terrainSize) * res)
+    const x = Math.max(0, Math.min(res - 1, hmapX))
+    const z = Math.max(0, Math.min(res - 1, hmapZ))
+    const index = z * res + x
+
+    if (!this.climateFields) this.computeClimateFields()
+    if (!this.biomeField) this.computeBiomeField()
+
+    const seaLevel = this.config.island.enabled ? this.config.island.seaLevel : this.lastMinHeight
+    return {
+      elevation: this.lastHeightData[index],
+      temperature: this.climateFields ? this.climateFields.temperature[index] : null,
+      humidity: this.climateFields ? this.climateFields.humidity[index] : null,
+      biome: this.biomeField ? BIOMES[this.biomeField.index[index]].name : null,
+      seaLevel,
+      underwater: this.config.island.enabled && this.lastHeightData[index] < seaLevel
+    }
+  }
+
   public resize(): void {
     const width = window.innerWidth
     const height = window.innerHeight
@@ -1764,6 +2132,45 @@ export class TerrainBuilder {
       version: '1.0.0'
     }
     return JSON.stringify(projectData, null, 2)
+  }
+
+  /**
+   * Build the exportable biome dataset: a JSON legend (the contract), PNG control
+   * maps (top-4 biome ids + weights), and raw binary buffers for lossless use.
+   * Texture-agnostic — consumers map biome ids to their own PBR materials and
+   * blend by the weights. Returns null until a terrain has been generated.
+   */
+  public getBiomeExport(): {
+    resolution: number
+    legendJson: string
+    indicesPng: string
+    weightsPng: string
+    indicesBin: Uint8Array
+    weightsBin: Float32Array
+  } | null {
+    if (!this.biomeField) this.computeBiomeField()
+    if (!this.biomeField) return null
+
+    const field = this.biomeField
+    const seaLevel = this.config.island.enabled ? this.config.island.seaLevel : this.lastMinHeight
+    const legend = BiomeSystem.legend(
+      { seaLevel, beachHeight: this.config.biome.beachHeight, blendMargin: this.config.biome.blendMargin },
+      {
+        resolution: field.resolution,
+        sizeKm: this.config.size,
+        seed: this.advancedTerrainGenerator.getSeed(),
+        temperatureScaleC: [TEMPERATURE_DISPLAY_MIN, TEMPERATURE_DISPLAY_MAX]
+      }
+    )
+
+    return {
+      resolution: field.resolution,
+      legendJson: JSON.stringify(legend, null, 2),
+      indicesPng: BiomeSystem.rgbaToDataURL(BiomeSystem.encodeIndicesRGBA(field), field.resolution),
+      weightsPng: BiomeSystem.rgbaToDataURL(BiomeSystem.encodeWeightsRGBA(field), field.resolution),
+      indicesBin: field.topIndices,
+      weightsBin: field.topWeights
+    }
   }
 
   public randomizeSeed(): void {

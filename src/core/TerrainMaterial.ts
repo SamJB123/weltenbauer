@@ -5,6 +5,7 @@ import {
   smoothstep,
   uniform,
   Fn,
+  attribute,
   positionWorld,
   normalWorld,
   dot,
@@ -247,7 +248,8 @@ export class TerrainMaterial {
     const triplanarScale = uniform(100.0)      // Triplanar mapping scale
     const bombingScale = uniform(0.0025)       // Texture bombing scale
     const simplexScale = uniform(0.002)        // Simplex noise scale for larger dirt/grass patches
-    
+    const biomeBlend = uniform(0.0)            // 0 = height/slope look, 1 = biome-driven texturing
+
     // Store uniforms for later access
     this.materialUniforms = {
       grassDirtHeight,
@@ -256,7 +258,8 @@ export class TerrainMaterial {
       slopeThreshold,
       triplanarScale,
       bombingScale,
-      simplexScale
+      simplexScale,
+      biomeBlend
     }
     
     // Advanced terrain shader with proper triplanar mapping and texture bombing
@@ -440,7 +443,20 @@ export class TerrainMaterial {
       
       // Apply snow/rock patches only at high elevations
       finalColor.assign(mix(finalColor, snowRockMix, isHighElevation))
-      
+
+      // Biome-driven texturing (dogfoods the exported biome data): blend the same
+      // four triplanar textures by per-vertex biome surface weights, then tint by
+      // the blended biome palette color. Mixed in by `biomeBlend` so the normal
+      // height/slope look is untouched at biomeBlend = 0.
+      const surfaceWeight = attribute('surfaceWeight', 'vec4')
+      const biomeTint = attribute('biomeTint', 'vec3')
+      const biomeSurface = dirtColor.mul(surfaceWeight.x)
+        .add(grassColor.mul(surfaceWeight.y))
+        .add(rockColor.mul(surfaceWeight.z))
+        .add(snowColor.mul(surfaceWeight.w))
+      const biomeColor = mix(biomeSurface, biomeTint, float(0.3))
+      finalColor.assign(mix(finalColor, biomeColor, biomeBlend))
+
       return finalColor
     })()
     
@@ -479,6 +495,13 @@ export class TerrainMaterial {
   public setMicroMacroEnabled(_enabled: boolean): void {
     // Advanced layering is always enabled in this implementation
     console.log(`Advanced layering is always enabled in advanced terrain material`)
+  }
+
+  /** 0 = height/slope texturing, 1 = biome-driven texturing (from vertex attributes). */
+  public setBiomeBlend(value: number): void {
+    if (this.materialUniforms.biomeBlend) {
+      this.materialUniforms.biomeBlend.value = value
+    }
   }
 
   public setTextureScale(scale: number): void {
