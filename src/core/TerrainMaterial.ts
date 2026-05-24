@@ -1,15 +1,17 @@
 import * as THREE from 'three/webgpu'
-import { 
-  texture, 
+import {
+  texture,
   mix,
   smoothstep,
   uniform,
   Fn,
   attribute,
   positionWorld,
+  positionLocal,
   normalWorld,
   dot,
   vec3,
+  vec4,
   vec2,
   mx_noise_float,
   sin,
@@ -19,6 +21,22 @@ import {
   abs,
   float
 } from 'three/tsl'
+import type { Node } from 'three/webgpu'
+import { BIOMES } from './BiomeSystem'
+
+/** Construction options. The solid/CSG mesh uses classifyFromSurfData + doubleSide. */
+export interface TerrainMaterialOptions {
+  /** Derive biome surface weights per-fragment from the `surfData` attribute
+   *  (temperature, humidity, surfaceHeight) instead of baked `surfaceWeight`/
+   *  `biomeTint` attributes. Used by the solidified terrain. */
+  classifyFromSurfData?: boolean
+  /** Render both faces (cave interiors need it). */
+  doubleSide?: boolean
+  /** Reuse another material's already-loaded textures instead of loading a fresh
+   *  (and async-racing) set. The solid shares the flat terrain's textures so its
+   *  node graph captures the real, loaded textures — not transient fallbacks. */
+  shareTexturesFrom?: TerrainMaterial
+}
 
 export class TerrainMaterial {
   private material: THREE.MeshStandardMaterial
@@ -26,13 +44,25 @@ export class TerrainMaterial {
   private noiseTexture!: THREE.Texture
   private bombingNoiseTexture!: THREE.Texture
   private simplexNoiseTexture!: THREE.Texture
-  
+  private opts: TerrainMaterialOptions
+
   // TSL uniforms for material parameters
   private materialUniforms: any = {}
-  
-  constructor() {
-    this.createNoiseTexture()
-    this.loadTextures()
+
+  constructor(opts: TerrainMaterialOptions = {}) {
+    this.opts = opts
+    if (opts.shareTexturesFrom) {
+      // Reuse the donor's loaded textures (same object refs) so this material's
+      // node graph binds the real textures, not its own fallback/async-racing set.
+      const src = opts.shareTexturesFrom
+      this.textures = src.textures
+      this.noiseTexture = src.noiseTexture
+      this.bombingNoiseTexture = src.bombingNoiseTexture
+      this.simplexNoiseTexture = src.simplexNoiseTexture
+    } else {
+      this.createNoiseTexture()
+      this.loadTextures()
+    }
     this.material = this.createAdvancedTSLMaterial()
   }
 
@@ -237,18 +267,24 @@ export class TerrainMaterial {
   private createAdvancedTSLMaterial(): THREE.MeshStandardMaterial {
     const material = new THREE.MeshStandardMaterial({
       metalness: 0,
-      roughness: 0.8
+      roughness: 0.8,
+      side: this.opts.doubleSide ? THREE.DoubleSide : THREE.FrontSide
     })
-    
+
     // TSL uniforms matching the reference code
     const grassDirtHeight = uniform(30.0)      // 0-30% - mixed dirt/grass layer
-    const rockHeight = uniform(25.0)           // 25-85% - rock layer starts early  
+    const rockHeight = uniform(25.0)           // 25-85% - rock layer starts early
     const snowHeight = uniform(85.0)           // 85-100% - snow layer (top 15%)
     const slopeThreshold = uniform(0.6)        // Slope threshold for rock emphasis
     const triplanarScale = uniform(100.0)      // Triplanar mapping scale
     const bombingScale = uniform(0.0025)       // Texture bombing scale
     const simplexScale = uniform(0.002)        // Simplex noise scale for larger dirt/grass patches
     const biomeBlend = uniform(0.0)            // 0 = height/slope look, 1 = biome-driven texturing
+
+    // Classification params (solid/CSG mode): match BiomeSystem.compute defaults.
+    const seaLevel = uniform(0.0)
+    const beachHeight = uniform(12.0)
+    const blendMargin = uniform(2.5)
 
     // Store uniforms for later access
     this.materialUniforms = {
@@ -259,7 +295,10 @@ export class TerrainMaterial {
       triplanarScale,
       bombingScale,
       simplexScale,
-      biomeBlend
+      biomeBlend,
+      seaLevel,
+      beachHeight,
+      blendMargin
     }
     
     // Advanced terrain shader with proper triplanar mapping and texture bombing
@@ -445,11 +484,76 @@ export class TerrainMaterial {
       finalColor.assign(mix(finalColor, snowRockMix, isHighElevation))
 
       // Biome-driven texturing (dogfoods the exported biome data): blend the same
-      // four triplanar textures by per-vertex biome surface weights, then tint by
-      // the blended biome palette color. Mixed in by `biomeBlend` so the normal
-      // height/slope look is untouched at biomeBlend = 0.
-      const surfaceWeight = attribute<'vec4'>('surfaceWeight', 'vec4')
-      const biomeTint = attribute<'vec3'>('biomeTint', 'vec3')
+      // four triplanar textures by biome surface weights, then tint by the blended
+      // biome palette color. Mixed in by `biomeBlend` so the normal height/slope
+      // look is untouched at biomeBlend = 0.
+      //
+      // Two sources for the weights/tint:
+      //  - flat terrain: baked `surfaceWeight`/`biomeTint` vertex attributes.
+      //  - solid/CSG:    classified per-fragment from the `surfData` attribute
+      //                  (temperature, humidity, surfaceHeight), with cut faces
+      //                  shading toward rock/bedrock by depth below the surface.
+      let surfaceWeight: Node<'vec4'> = attribute<'vec4'>('surfaceWeight', 'vec4')
+      let biomeTint: Node<'vec3'> = attribute<'vec3'>('biomeTint', 'vec3')
+      if (this.opts.classifyFromSurfData) {
+        // Per-fragment biome classification, mirroring BiomeSystem.classifySample
+        // (sort-free all-biome accumulate, verified to match the canonical path).
+        // Reads the packed `surfData` attribute (x=temperature, y=humidity,
+        // z=surfaceHeight); cut faces shade toward rock/bedrock by depth.
+        const surfData = attribute<'vec3'>('surfData', 'vec3')
+        const temp = surfData.x
+        const hum = surfData.y
+        const surfaceHeight = surfData.z
+
+        const tMargin = blendMargin.max(float(0.5))
+        const hMargin = float(0.08)
+        const beachMargin = beachHeight.mul(0.5).max(float(1.0))
+
+        // Trapezoidal membership: ~1 inside [lo,hi], ramping over margin m each side.
+        // Explicit generic selects Fn's args overload (else it reads the lambda's
+        // sole param as the NodeBuilder and yields a zero-arg function).
+        const softBand = Fn<[Node<'float'>, Node<'float'>, Node<'float'>, Node<'float'>], Node<'float'>>(
+          ([v, lo, hi, m]) =>
+            smoothstep(lo.sub(m), lo, v).mul(smoothstep(hi, hi.add(m), v).oneMinus()).clamp(0, 1)
+        )
+        // Route a biome's weight into its surface-texture channel (soil/grass/rock/snow).
+        const maskFor = (s: number) =>
+          s === 0 ? vec4(1, 0, 0, 0) : s === 1 ? vec4(0, 1, 0, 0) : s === 2 ? vec4(0, 0, 1, 0) : vec4(0, 0, 0, 1)
+
+        const oceanW = float(1).sub(smoothstep(seaLevel.sub(beachMargin), seaLevel, surfaceHeight))
+        const beachW = softBand(surfaceHeight, seaLevel, seaLevel.add(beachHeight), beachMargin).mul(oceanW.oneMinus())
+        const landFactor = smoothstep(seaLevel.add(beachHeight.mul(0.5)), seaLevel.add(beachHeight.mul(1.5)), surfaceHeight)
+
+        const sw = vec4(0, 0, 0, 0).toVar()
+        const tintAcc = vec3(0, 0, 0).toVar()
+        const sum = float(0).toVar()
+
+        for (const b of BIOMES) {
+          const w = b.id === 0 ? oceanW
+            : b.id === 1 ? beachW
+            : softBand(temp, float(b.temperature![0]), float(b.temperature![1]), tMargin)
+                .mul(softBand(hum, float(b.humidity![0]), float(b.humidity![1]), hMargin)).mul(landFactor)
+          sw.addAssign(maskFor(b.surface).mul(w))
+          tintAcc.addAssign(vec3(b.color[0], b.color[1], b.color[2]).mul(w))
+          sum.addAssign(w)
+        }
+
+        const safeSum = sum.max(float(1e-4))
+        sw.assign(sw.div(safeSum))
+        tintAcc.assign(tintAcc.div(safeSum))
+
+        // Cut faces: shade toward rock then bedrock by depth below the surface.
+        // surfData.z and positionLocal.y are both in the solid's local (heightfield) space.
+        const depth = surfaceHeight.sub(positionLocal.y).max(0)
+        const rockMix = smoothstep(float(1.0), float(10.0), depth)
+        sw.assign(mix(sw, vec4(0, 0, 1, 0), rockMix))
+        const bedrock = vec3(0.28, 0.28, 0.32)
+        const darken = smoothstep(float(10.0), float(30.0), depth)
+        tintAcc.assign(mix(tintAcc, bedrock, rockMix.mul(0.5).max(darken)))
+
+        surfaceWeight = sw
+        biomeTint = tintAcc
+      }
       const biomeSurface = dirtColor.mul(surfaceWeight.x)
         .add(grassColor.mul(surfaceWeight.y))
         .add(rockColor.mul(surfaceWeight.z))
@@ -465,6 +569,13 @@ export class TerrainMaterial {
   
   public getMaterial(): THREE.MeshStandardMaterial {
     return this.material
+  }
+
+  /** Solid/CSG mode: set the classification params (match BiomeSystem options). */
+  public setClassifyParams(seaLevel: number, beachHeight: number, blendMargin: number): void {
+    if (this.materialUniforms.seaLevel) this.materialUniforms.seaLevel.value = seaLevel
+    if (this.materialUniforms.beachHeight) this.materialUniforms.beachHeight.value = beachHeight
+    if (this.materialUniforms.blendMargin) this.materialUniforms.blendMargin.value = blendMargin
   }
   
   public updateHeightRange(minHeight: number, maxHeight: number): void {
@@ -523,6 +634,8 @@ export class TerrainMaterial {
   
   public dispose(): void {
     this.material.dispose()
+    // Don't dispose textures we borrowed from another material — the donor owns them.
+    if (this.opts.shareTexturesFrom) return
     this.noiseTexture.dispose()
     this.bombingNoiseTexture?.dispose()
     this.simplexNoiseTexture?.dispose()

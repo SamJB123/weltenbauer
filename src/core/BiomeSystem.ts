@@ -203,7 +203,88 @@ export class BiomeSystem {
     return out
   }
 
+  /**
+   * Per-sample classification used by the solid/CSG TSL material: turns one
+   * (height, temperature, humidity) sample into the 4 surface-texture weights
+   * (soil, grass, rock, snow) + a blended tint, WITHOUT the top-K selection that
+   * `compute()` does for the export. It accumulates all biome membership weights
+   * straight into the 4 channels and normalizes — which is what a per-fragment
+   * shader can do cheaply (no sort). In practice only a handful of biomes have
+   * non-zero weight at any sample, so this matches `surfaceWeights()` /
+   * `paletteColors()` (the top-4 path) to within rounding; see the Step-0
+   * verification script. Mirrors the exact band math in `compute()`.
+   */
+  static classifySample(
+    height: number,
+    temperature: number,
+    humidity: number,
+    opts: BiomeOptions
+  ): { surface: [number, number, number, number]; tint: [number, number, number] } {
+    const { seaLevel, beachHeight } = opts
+    const tMargin = Math.max(0.5, opts.blendMargin)
+    const hMargin = HUMIDITY_MARGIN
+    const beachMargin = Math.max(1, beachHeight * 0.5)
+
+    const w = new Array<number>(NUM_BIOMES).fill(0)
+    const oceanW = 1 - smoothstep(seaLevel - beachMargin, seaLevel, height)
+    const beachW = softBand(height, seaLevel, seaLevel + beachHeight, beachMargin) * (1 - oceanW)
+    const landFactor = smoothstep(seaLevel + beachHeight * 0.5, seaLevel + beachHeight * 1.5, height)
+
+    w[OCEAN_ID] = oceanW
+    w[BEACH_ID] = beachW
+    for (let b = FIRST_CLIMATE_ID; b < NUM_BIOMES; b++) {
+      const def = BIOMES[b]
+      const tBand = softBand(temperature, def.temperature![0], def.temperature![1], tMargin)
+      const hBand = softBand(humidity, def.humidity![0], def.humidity![1], hMargin)
+      w[b] = tBand * hBand * landFactor
+    }
+
+    const surface: [number, number, number, number] = [0, 0, 0, 0]
+    const tint: [number, number, number] = [0, 0, 0]
+
+    let sum = 0
+    for (let b = 0; b < NUM_BIOMES; b++) sum += w[b]
+
+    if (sum > 1e-6) {
+      for (let b = 0; b < NUM_BIOMES; b++) {
+        const nw = w[b] / sum
+        if (nw === 0) continue
+        const def = BIOMES[b]
+        surface[def.surface] += nw
+        tint[0] += def.color[0] * nw
+        tint[1] += def.color[1] * nw
+        tint[2] += def.color[2] * nw
+      }
+    } else {
+      // Whittaker gap: fall back to the single nearest biome at full weight.
+      let best = 0
+      for (let b = 1; b < NUM_BIOMES; b++) if (w[b] > w[best]) best = b
+      const def = BIOMES[best]
+      surface[def.surface] = 1
+      tint[0] = def.color[0]
+      tint[1] = def.color[1]
+      tint[2] = def.color[2]
+    }
+
+    return { surface, tint }
+  }
+
   // --- Export helpers -------------------------------------------------------
+
+  /** The biome legend as JSON-serializable rows — the per-biome contract shared by
+   *  the 2.5D map set and the solid (CSG) export. */
+  static legendBiomes(): object[] {
+    return BIOMES.map(b => ({
+      id: b.id,
+      key: b.key,
+      name: b.name,
+      color: rgbToHex(b.color),
+      surface: Object.keys(SURFACE)[b.surface].toLowerCase(),
+      temperature: b.temperature,
+      humidity: b.humidity,
+      rule: b.rule ?? null
+    }))
+  }
 
   /** JSON-serializable legend + metadata: the contract a consuming engine reads. */
   static legend(opts: BiomeOptions, meta: Record<string, unknown>): object {
@@ -219,16 +300,7 @@ export class BiomeSystem {
       },
       classification: { seaLevel: opts.seaLevel, beachHeight: opts.beachHeight, blendMargin: opts.blendMargin },
       meta,
-      biomes: BIOMES.map(b => ({
-        id: b.id,
-        key: b.key,
-        name: b.name,
-        color: rgbToHex(b.color),
-        surface: Object.keys(SURFACE)[b.surface].toLowerCase(),
-        temperature: b.temperature,
-        humidity: b.humidity,
-        rule: b.rule ?? null
-      }))
+      biomes: BiomeSystem.legendBiomes()
     }
   }
 

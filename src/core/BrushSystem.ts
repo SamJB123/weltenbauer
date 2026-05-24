@@ -51,7 +51,8 @@ export class BrushSystem {
   private _originalHeightData: Float32Array | null = null
   private resolution: number = 0
   private terrainSize: number = 1000
-  
+  private modCount: number = 0 // bumped on every heightmap edit, so others can detect changes
+
   private brushSettings: BrushSettings = {
     size: 10,
     strength: 0.5,
@@ -269,8 +270,14 @@ export class BrushSystem {
     this.updateTerrainMesh()
   }
 
+  /** Incremented on every heightmap edit so external systems can detect brush changes. */
+  public getModCount(): number {
+    return this.modCount
+  }
+
   private modifyHeightmap(centerX: number, centerZ: number): void {
     if (!this.heightData) return
+    this.modCount++
 
     const brushRadius = (this.brushSettings.size / this.terrainSize) * this.resolution
     const baseStrength = this.brushSettings.strength * 1.5 // Base strength multiplier

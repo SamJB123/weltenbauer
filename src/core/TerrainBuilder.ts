@@ -1,13 +1,28 @@
 import * as THREE from 'three/webgpu'
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js'
+import { TransformControls } from 'three/addons/controls/TransformControls.js'
+import { GLTFExporter } from 'three/addons/exporters/GLTFExporter.js'
 import { AdvancedTerrainGenerator, TerrainType } from './AdvancedTerrainGenerator'
 import { BrushSystem } from './BrushSystem'
 import { ErosionSystem, ErosionConfig, AdvancedErosionConfig } from './ErosionSystem'
 import { TerrainMaterial } from './TerrainMaterial'
 import { ClimateSystem, ClimateFields, ClimateView, TEMPERATURE_DISPLAY_MIN, TEMPERATURE_DISPLAY_MAX } from './ClimateSystem'
 import { BiomeSystem, BiomeField, BIOMES } from './BiomeSystem'
-import { buildSolidGeometry, carveSphere } from './CsgSystem'
+import { buildSolidGeometry, evaluateOperations, applyOperation, cutterGeometry, CsgOperationDef, CsgShape, CsgOp, SurfaceSampler } from './CsgSystem'
+import { computeBoundsTree, disposeBoundsTree, acceleratedRaycast } from 'three-mesh-bvh'
+
+// Accelerate raycasts against carved CSG meshes so the Dig tools can pick any 3D
+// surface (cliff faces, cave walls, overhang undersides) cheaply. Meshes without a
+// boundsTree (e.g. the heightfield terrain) fall back to the default raycast.
+;(THREE.BufferGeometry.prototype as any).computeBoundsTree = computeBoundsTree
+;(THREE.BufferGeometry.prototype as any).disposeBoundsTree = disposeBoundsTree
+;(THREE.Mesh.prototype as any).raycast = acceleratedRaycast
+
+/** Carve tools: which cutter shape the Dig interaction places. */
+export type CsgTool = 'none' | 'dig' | 'chamber' | 'tunnel'
 import { buildMapSet, MapSetExport } from './MapExport'
+import { bakeSdfVolume } from './SdfBake'
+import { bakeSdfVolumeGPU } from './SdfBakeGPU'
 import { encodeIslandProject, decodeIslandProject } from './IslandProject'
 import { TerrainWorkerMessage, TerrainWorkerResponse } from './TerrainWorker'
 
@@ -90,7 +105,45 @@ export class TerrainBuilder {
   private gridHelper: THREE.GridHelper | null = null
   private waterPlane: THREE.Mesh | null = null
   private lastAvgHeight: number = 0
-  private csgMesh: THREE.Mesh | null = null // Stage-1 CSG demo result (carved solid)
+  // CSG (non-destructive op stack)
+  private csgMesh: THREE.Mesh | null = null      // carved-solid result currently shown
+  private csgOperations: CsgOperationDef[] = []   // editable cutter stack
+  private csgNextId: number = 1
+  private csgActive: boolean = false              // whether the carved solid is displayed
+  private csgUndergroundDepth: number = 60        // floor depth below sea level
+  // Incremental-evaluation cache: the solidified terrain (rebuilt only on enter /
+  // floor change) that cuts apply to, plus the surface data for strata coloring.
+  private csgBaseSolid: THREE.BufferGeometry | null = null
+  private csgSurfaceData: Float32Array | null = null
+  private csgSurfaceRes: number = 0
+  // Climate at the (capped) solid resolution, carried onto the solid + cut faces.
+  private csgSurfaceTemp: Float32Array | null = null
+  private csgSurfaceHum: Float32Array | null = null
+  // The solid's biome material: classifies per-fragment from the carried `surfData`,
+  // double-sided for cave interiors. Created lazily, reused across carves.
+  private csgSolidMaterial: TerrainMaterial | null = null
+  // Double-sided vertex-color material for the solid's flat debug views
+  // (temperature / humidity / biome palette), mirroring the flat terrain.
+  private csgDebugMaterial: THREE.MeshStandardMaterial | null = null
+
+  // CSG carve tools (surface-aware digging)
+  private csgTool: CsgTool = 'none'
+  private csgToolOperation: CsgOp = 'subtract'    // subtract (dig) or add (build out)
+  private csgBrushSize: number = 40               // world-unit size of the cutter
+  private csgRaycaster = new THREE.Raycaster()
+  private csgGhost: THREE.Mesh | null = null       // translucent preview of the next cut
+  private csgGhostShape: CsgShape | null = null    // geometry currently on the ghost
+  private csgAxisArrow: THREE.ArrowHelper | null = null // shows the carve direction
+  // Drag-stroke brush state
+  private csgStroking: boolean = false
+  private csgStrokePoints: [number, number, number][] = [] // solid-space sphere centers along the stroke
+  private csgLastSampleWorld: THREE.Vector3 | null = null
+  private csgStrokePreview: THREE.InstancedMesh | null = null // live trail of ghost dabs
+  private readonly csgStrokeMax: number = 200      // cap stroke length (bounds the release-time bake)
+  // 3D gizmo editing of a single cutter
+  private transformControls: any = null            // TransformControls (addon, untyped)
+  private csgGizmoProxy: THREE.Object3D | null = null // dummy the gizmo manipulates
+  private csgSelectedOpId: number | null = null
 
   // Cursor sampling
   private hoverRaycaster = new THREE.Raycaster()
@@ -102,6 +155,7 @@ export class TerrainBuilder {
   private lastHeightData: Float32Array | null = null
   private lastMinHeight: number = 0
   private lastMaxHeight: number = 0
+  private lastBrushModCount: number = 0 // tracks brush edits so derived data can re-sync
 
   private mode: EditorMode = 'orbit'
   private noisePreviewCanvas: HTMLCanvasElement
@@ -253,7 +307,25 @@ export class TerrainBuilder {
         }
       }
     })
-    
+
+    // Gizmo shortcuts (only while a cutter is attached): W/E/R switch the gizmo
+    // mode, Esc stops editing. Ignored while typing in a field or with modifiers.
+    document.addEventListener('keydown', (event) => {
+      if (this.csgSelectedOpId === null) return
+      if (event.ctrlKey || event.metaKey || event.altKey) return
+      const t = event.target as HTMLElement | null
+      if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.isContentEditable)) return
+      const k = event.key.toLowerCase()
+      if (k === 'w') { this.setGizmoMode('translate'); event.preventDefault() }
+      else if (k === 'e') { this.setGizmoMode('rotate'); event.preventDefault() }
+      else if (k === 'r') { this.setGizmoMode('scale'); event.preventDefault() }
+      else if (k === 'escape') {
+        this.deselectCsgGizmo()
+        this.uiController?.rebuildCsgOpsGui?.()
+        event.preventDefault()
+      }
+    })
+
     // Start render loop
     this.animate()
   }
@@ -1507,8 +1579,10 @@ export class TerrainBuilder {
   private async createTerrainMesh(heightData: Float32Array, applyMask: boolean = true): Promise<void> {
     console.log('Creating terrain mesh...')
 
-    // A regenerated terrain invalidates any CSG demo result.
+    // A regenerated terrain invalidates the carved CSG result; drop CSG mode so
+    // the fresh terrain shows (the cutter stack is kept and can be re-applied).
     this.clearCsgDemo()
+    this.csgActive = false
 
     // Reshape into an island (borders below sea level) before stats/mesh/brush see it.
     // Skipped when loading a saved project — that heightfield is already final.
@@ -1614,6 +1688,27 @@ export class TerrainBuilder {
    * Recompute the cached temperature/humidity fields from the most recent
    * heightmap. No-op until a terrain has been generated.
    */
+  /**
+   * If the brush has edited the heightfield since we last looked, adopt its live
+   * data as the source of truth and invalidate the derived climate/biome caches.
+   * Keeps the cursor readout, climate/biome maps, and the CSG solidifier in step
+   * with brush edits (which mutate the brush's own copy of the height data).
+   */
+  private syncHeightFromBrush(): void {
+    const v = this.brushSystem.getModCount()
+    if (v === this.lastBrushModCount) return
+    this.lastBrushModCount = v
+
+    const live = this.brushSystem.getHeightData()
+    if (!live || live.length === 0) return
+    this.lastHeightData = live
+    const { minHeight, maxHeight } = this.calculateHeightStats(live)
+    this.lastMinHeight = minHeight
+    this.lastMaxHeight = maxHeight
+    this.climateFields = null
+    this.biomeField = null
+  }
+
   private computeClimateFields(): void {
     if (!this.lastHeightData) return
 
@@ -1660,6 +1755,7 @@ export class TerrainBuilder {
    */
   private applyViewMode(): void {
     if (!this.terrain) return
+    this.syncHeightFromBrush() // climate/biome maps should reflect brush edits
 
     const geometry = this.terrain.geometry as THREE.BufferGeometry
     const mode = this.config.climate.viewMode
@@ -1741,6 +1837,7 @@ export class TerrainBuilder {
   public setClimateViewMode(mode: ClimateView): void {
     this.config.climate.viewMode = mode
     this.applyViewMode()
+    if (this.csgActive) this.applyCsgViewMode() // carry the view through to the solid
   }
 
   /**
@@ -2084,6 +2181,7 @@ export class TerrainBuilder {
    * fields are computed on demand and cached, so this works in any view mode.
    */
   public sampleAtNDC(ndcX: number, ndcY: number): TerrainSample | null {
+    this.syncHeightFromBrush() // reflect brush edits in elevation/climate/biome
     if (!this.terrain || !this.lastHeightData) return null
 
     this.hoverRaycaster.setFromCamera(new THREE.Vector2(ndcX, ndcY), this.camera)
@@ -2170,28 +2268,102 @@ export class TerrainBuilder {
     }
   }
 
-  /**
-   * Stage-1 CSG proof of concept: build a watertight solid from the current
-   * heightfield (capped to a modest resolution so the boolean is fast), subtract
-   * a demo sphere to carve a cave, and show the carved result in place of the
-   * terrain. Calling again toggles back to the normal terrain. This is a separate
-   * 3D representation — it does not affect the heightfield or any exports.
-   */
-  public runCsgDemo(undergroundDepth: number = 60): boolean {
-    // Toggle off: remove the carved mesh and restore the terrain.
-    if (this.csgMesh) {
-      this.scene.remove(this.csgMesh)
-      this.csgMesh.geometry.dispose()
-      ;(this.csgMesh.material as THREE.Material).dispose()
-      this.csgMesh = null
-      if (this.terrain) this.terrain.visible = true
-      if (this.waterPlane) this.waterPlane.visible = true
-      return false
+  // --- CSG: non-destructive cutter stack (incremental evaluation) ----------
+
+  /** Enter CSG mode: solidify the terrain and show the carved result (hiding the heightfield terrain). */
+  public enterCsgMode(): void {
+    this.csgActive = true
+    this.rebuildCsgSolid()
+    this.fullEvaluateCsg()
+  }
+
+  /** Leave CSG mode: remove the carved solid and restore the heightfield terrain. */
+  public exitCsgMode(): void {
+    this.csgActive = false
+    this.csgTool = 'none'
+    this.csgStroking = false
+    this.deselectCsgGizmo()
+    this.hideCsgGizmos()
+    this.clearStrokePreview()
+    this.restoreOrbitButtons()
+    this.clearCsgDemo()
+    if (this.terrain) this.terrain.visible = true
+    if (this.waterPlane) this.waterPlane.visible = true
+  }
+
+  public isCsgActive(): boolean {
+    return this.csgActive
+  }
+
+  public getCsgOperations(): CsgOperationDef[] {
+    return this.csgOperations
+  }
+
+  public setCsgUndergroundDepth(depth: number): void {
+    this.csgUndergroundDepth = depth
+    if (this.csgActive) { this.rebuildCsgSolid(); this.fullEvaluateCsg() } // floor change → re-solidify
+  }
+
+  /** Sensible world-space extents for placing/sizing cutters (for GUI ranges). */
+  public getCsgBounds(): { size: number; seaLevel: number; minHeight: number; maxHeight: number } {
+    const seaLevel = this.config.island.enabled ? this.config.island.seaLevel : this.lastMinHeight
+    return { size: this.config.size * 1000, seaLevel, minHeight: this.lastMinHeight, maxHeight: this.lastMaxHeight }
+  }
+
+  /** Add a cutter to the stack with sensible defaults near the surface, then re-evaluate. */
+  public addCsgOperation(shape: CsgShape): CsgOperationDef {
+    const size = this.config.size * 1000
+    const seaLevel = this.config.island.enabled ? this.config.island.seaLevel : this.lastMinHeight
+    const s = size * 0.15
+    const op: CsgOperationDef = {
+      id: this.csgNextId++,
+      shape,
+      position: [0, seaLevel + (this.lastMaxHeight - seaLevel) * 0.5, 0],
+      rotation: [0, 0, 0],
+      scale: [s, s, s],
+      operation: 'subtract',
+      enabled: true
     }
+    this.csgOperations.push(op)
+    if (!this.csgActive) this.csgActive = true
+    if (!this.csgBaseSolid) this.rebuildCsgSolid()
+    this.appendEvaluateCsg(op) // incremental: just cut the new shape in
+    return op
+  }
 
-    if (!this.lastHeightData) return false
+  public updateCsgOperation(id: number, partial: Partial<CsgOperationDef>): void {
+    const op = this.csgOperations.find(o => o.id === id)
+    if (!op) return
+    Object.assign(op, partial)
+    if (this.csgActive) this.fullEvaluateCsg() // edit → replay stack on the cached base
+  }
 
-    // Cap the solid resolution for a responsive proof of concept (revisit later).
+  public removeCsgOperation(id: number): void {
+    if (this.csgSelectedOpId === id) this.deselectCsgGizmo()
+    this.csgOperations = this.csgOperations.filter(o => o.id !== id)
+    if (this.csgActive) this.fullEvaluateCsg()
+  }
+
+  public clearCsgOperations(): void {
+    this.deselectCsgGizmo()
+    this.csgOperations = []
+    if (this.csgActive) this.fullEvaluateCsg()
+  }
+
+  /** Full re-evaluate (replay the whole stack on the cached base solid). */
+  public evaluateCsg(): void {
+    this.fullEvaluateCsg()
+  }
+
+  /**
+   * (Re)build the cached solidified terrain — the base every cut applies to.
+   * This is the expensive part (solid build + biome colors), so it runs only on
+   * enter, floor-depth change, or terrain regeneration — never per dab.
+   */
+  private rebuildCsgSolid(): void {
+    this.syncHeightFromBrush() // solidify the brush-edited terrain, not the original
+    if (!this.lastHeightData) return
+
     const cap = 256
     const res0 = this.config.resolution
     let data = this.lastHeightData
@@ -2200,41 +2372,619 @@ export class TerrainBuilder {
       data = this.resampleHeightData(this.lastHeightData, res0, cap)
       res = cap
     }
+    this.csgSurfaceData = data
+    this.csgSurfaceRes = res
 
     const size = this.config.size * 1000
     const seaLevel = this.config.island.enabled ? this.config.island.seaLevel : this.lastMinHeight
 
-    const solidGeometry = buildSolidGeometry(data, res, { size, seaLevel, undergroundDepth })
+    // Climate carried onto the solid (resampled to the capped solid resolution);
+    // the solid's material classifies biomes per-fragment from it.
+    if (!this.climateFields) this.computeClimateFields()
+    let topTemp = this.climateFields?.temperature
+    let topHum = this.climateFields?.humidity
+    if (topTemp && res0 > cap) topTemp = this.resampleHeightData(topTemp, res0, cap)
+    if (topHum && res0 > cap) topHum = this.resampleHeightData(topHum, res0, cap)
+    this.csgSurfaceTemp = topTemp ?? null
+    this.csgSurfaceHum = topHum ?? null
 
-    // Demo cut: a sphere biting into the terrain a little off-center.
-    const center = new THREE.Vector3(0, seaLevel + (this.lastMaxHeight - seaLevel) * 0.4, size * 0.05)
-    const radius = size * 0.12
-    const carvedGeometry = carveSphere(solidGeometry, center, radius)
-    solidGeometry.dispose()
-
-    const material = new THREE.MeshStandardMaterial({
-      color: 0x9a8c7a,
-      roughness: 1.0,
-      metalness: 0.0,
-      side: THREE.DoubleSide // so the carved cavity interior is visible
+    if (this.csgBaseSolid) this.csgBaseSolid.dispose()
+    this.csgBaseSolid = buildSolidGeometry(data, res, {
+      size, seaLevel, undergroundDepth: this.csgUndergroundDepth,
+      topTemperature: topTemp, topHumidity: topHum
     })
-    const mesh = new THREE.Mesh(carvedGeometry, material)
+  }
+
+  private csgSurface(): SurfaceSampler {
+    const n = this.csgSurfaceRes * this.csgSurfaceRes
+    return {
+      heightData: this.csgSurfaceData!,
+      resolution: this.csgSurfaceRes,
+      size: this.config.size * 1000,
+      temperature: this.csgSurfaceTemp ?? new Float32Array(n),
+      humidity: this.csgSurfaceHum ?? new Float32Array(n)
+    }
+  }
+
+  /** Replay the whole operation stack against the cached base solid (edits/deletes). */
+  private fullEvaluateCsg(): void {
+    if (!this.csgBaseSolid) this.rebuildCsgSolid()
+    if (!this.csgBaseSolid) return
+    const carved = evaluateOperations(this.csgBaseSolid, this.csgOperations, this.csgSurface())
+    this.setCsgCarved(carved)
+  }
+
+  /** Apply only the new op to the current carved result — O(1), for click-to-dab. */
+  private appendEvaluateCsg(op: CsgOperationDef): void {
+    if (!this.csgBaseSolid) this.rebuildCsgSolid()
+    if (!this.csgBaseSolid) return
+    const src = this.csgMesh ? (this.csgMesh.geometry as THREE.BufferGeometry) : this.csgBaseSolid
+    const carved = applyOperation(src, op, this.csgSurface())
+    this.setCsgCarved(carved)
+  }
+
+  /**
+   * Show a freshly carved geometry: dispose the old display, build a picking BVH,
+   * wrap in a vertex-colored DoubleSide mesh, and hide the heightfield terrain.
+   */
+  private setCsgCarved(geometry: THREE.BufferGeometry): void {
+    if (this.csgMesh) {
+      this.scene.remove(this.csgMesh)
+      ;(this.csgMesh.geometry as any).disposeBoundsTree?.()
+      this.csgMesh.geometry.dispose()
+      // Note: the material is shared across carves — disposed in clearCsgDemo/dispose.
+    }
+    ;(geometry as any).computeBoundsTree()
+
+    // The carved solid renders with the real biome TSL material, classifying
+    // per-fragment from the carried `surfData` (temperature, humidity, surfaceHeight)
+    // — the same data/contract a consumer gets. Cut faces shade to strata by depth.
+    if (!this.csgSolidMaterial) {
+      // Share the flat terrain's loaded textures so the solid's node graph binds the
+      // real textures (a fresh instance races its own async loads → purple fallback).
+      this.csgSolidMaterial = new TerrainMaterial({
+        classifyFromSurfData: true, doubleSide: true, shareTexturesFrom: this.terrainMaterial
+      })
+      this.csgSolidMaterial.setBiomeBlend(1)
+    }
+    const seaLevel = this.config.island.enabled ? this.config.island.seaLevel : this.lastMinHeight
+    this.csgSolidMaterial.setClassifyParams(seaLevel, this.config.biome.beachHeight, this.config.biome.blendMargin)
+    this.csgSolidMaterial.updateHeightRange(this.lastMinHeight, this.lastMaxHeight)
+
+    const mesh = new THREE.Mesh(geometry, this.csgSolidMaterial.getMaterial())
     mesh.position.y = this.terrain ? this.terrain.position.y : 0
     this.scene.add(mesh)
     this.csgMesh = mesh
+    this.applyCsgViewMode() // honor the active climate/biome view on the solid
 
-    // Hide the heightfield terrain + water while showing the solid.
     if (this.terrain) this.terrain.visible = false
     if (this.waterPlane) this.waterPlane.visible = false
+  }
+
+  /**
+   * Make the carved solid honor the active climate view (the same dropdown that
+   * drives the flat terrain). normal/biome use the solid's textured TSL material
+   * (biomeBlend 0/1); temperature/humidity/biomePalette use a flat vertex-color
+   * material, with the colours computed from the carried `surfData` via the SAME
+   * CPU functions the flat terrain uses — so the two views match.
+   */
+  private applyCsgViewMode(): void {
+    if (!this.csgMesh || !this.csgSolidMaterial) return
+    const mode = this.config.climate.viewMode
+
+    if (mode === 'normal' || mode === 'biome') {
+      this.csgSolidMaterial.setBiomeBlend(mode === 'biome' ? 1 : 0)
+      this.csgMesh.material = this.csgSolidMaterial.getMaterial()
+      return
+    }
+
+    // Flat debug views — compute a per-vertex colour from the geometry's surfData.
+    const geo = this.csgMesh.geometry as THREE.BufferGeometry
+    const sd = geo.getAttribute('surfData')
+    if (!sd) return
+    const n = sd.count
+    const colors = new Float32Array(n * 3)
+
+    if (mode === 'biomeColor') {
+      const seaLevel = this.config.island.enabled ? this.config.island.seaLevel : this.lastMinHeight
+      const opts = { seaLevel, beachHeight: this.config.biome.beachHeight, blendMargin: this.config.biome.blendMargin }
+      for (let i = 0; i < n; i++) {
+        const { tint } = BiomeSystem.classifySample(sd.getZ(i), sd.getX(i), sd.getY(i), opts)
+        colors[i * 3] = tint[0]; colors[i * 3 + 1] = tint[1]; colors[i * 3 + 2] = tint[2]
+      }
+    } else {
+      const field = new Float32Array(n)
+      for (let i = 0; i < n; i++) field[i] = mode === 'temperature' ? sd.getX(i) : sd.getY(i)
+      const range = mode === 'temperature'
+        ? { min: TEMPERATURE_DISPLAY_MIN, max: TEMPERATURE_DISPLAY_MAX }
+        : { min: 0, max: 1 }
+      colors.set(ClimateSystem.fieldToColors(field, mode, range))
+    }
+
+    geo.setAttribute('color', new THREE.BufferAttribute(colors, 3))
+    if (!this.csgDebugMaterial) {
+      this.csgDebugMaterial = new THREE.MeshStandardMaterial({
+        vertexColors: true, roughness: 1.0, metalness: 0.0, side: THREE.DoubleSide
+      })
+    }
+    this.csgMesh.material = this.csgDebugMaterial
+  }
+
+  /** Tear down the carved display and the cached base solid. */
+  private clearCsgDemo(): void {
+    if (this.csgMesh) {
+      this.scene.remove(this.csgMesh)
+      ;(this.csgMesh.geometry as any).disposeBoundsTree?.()
+      this.csgMesh.geometry.dispose()
+      this.csgMesh = null
+    }
+    if (this.csgSolidMaterial) { this.csgSolidMaterial.dispose(); this.csgSolidMaterial = null }
+    if (this.csgDebugMaterial) { this.csgDebugMaterial.dispose(); this.csgDebugMaterial = null }
+    if (this.csgBaseSolid) { this.csgBaseSolid.dispose(); this.csgBaseSolid = null }
+    this.csgSurfaceData = null
+    this.csgSurfaceTemp = null
+    this.csgSurfaceHum = null
+  }
+
+  /**
+   * Bake a signed-distance volume from the carved solid and return it as raw
+   * float16 binary + a JSON manifest, for a consumer engine to use for cheap
+   * distance-based soft shadows / AO / collision. The volume is in the mesh's
+   * local space (same frame as the exported island-carved.glb geometry).
+   * Resolves null if there's no carved result (not in CSG mode).
+   */
+  public async exportSdfVolume(
+    res: number,
+    onProgress?: (fraction: number) => void
+  ): Promise<{ json: string; bin: ArrayBuffer } | null> {
+    if (!this.csgMesh) return null
+
+    // GPU bake (three-mesh-bvh WGSL) — one compute dispatch. Falls back to the CPU
+    // bake only if the GPU path errors, so an export still succeeds while iterating.
+    let vol
+    let baker = 'gpu'
+    try {
+      vol = await bakeSdfVolumeGPU(this.renderer, this.csgMesh, res)
+    } catch (error) {
+      console.error('GPU SDF bake failed — falling back to CPU bake:', error)
+      baker = 'cpu'
+      vol = await bakeSdfVolume(this.csgMesh, res, onProgress)
+    }
+    console.log(`SDF baked on ${baker} at ${res}³`)
+
+    const manifest = {
+      format: 'weltenbauer-sdf',
+      version: 1,
+      dimensions: vol.dims,
+      layout: 'x + y*nx + z*nx*ny (x fastest)',
+      dataType: 'float16',
+      encoding: 'signed distance in mesh-local units (≈ metres); negative = inside the solid',
+      bounds: { min: vol.min, size: vol.size }, // mesh-local space
+      voxelSize: [vol.size[0] / vol.dims[0], vol.size[1] / vol.dims[1], vol.size[2] / vol.dims[2]],
+      pairsWith: 'island-carved.glb',
+      seed: this.advancedTerrainGenerator.getSeed(),
+      notes: 'Transform a world point into the glb mesh-local frame, trilinearly sample sdf.bin; value < 0 is inside.'
+    }
+    return { json: JSON.stringify(manifest, null, 2), bin: vol.data.buffer as ArrayBuffer }
+  }
+
+  /**
+   * Commit/bake the carved solid for a consumer scene: a binary glTF (.glb) plus a
+   * JSON contract. The mesh carries `_SURFDATA` per vertex (vec3: temperature °C,
+   * humidity 0..1, surfaceHeight m) — the same texture-agnostic data a 2.5D-map
+   * consumer gets — so the consumer classifies biomes from it exactly as we do
+   * in-app (depth below surface = surfaceHeight − local Y). The manifest carries the
+   * biome legend, the classification params, and the recipe. No baked colours or
+   * textures: use our biomes or your own. Resolves null if there's no carved result.
+   */
+  public async exportCarvedSolid(): Promise<{ glb: ArrayBuffer; manifestJson: string } | null> {
+    if (!this.csgMesh) return null
+
+    const glb = await new Promise<ArrayBuffer>((resolve, reject) => {
+      new GLTFExporter().parse(
+        this.csgMesh!,
+        (result: ArrayBuffer | object) => resolve(result as ArrayBuffer),
+        (error: unknown) => reject(error),
+        { binary: true }
+      )
+    })
+
+    const seaLevel = this.config.island.enabled ? this.config.island.seaLevel : this.lastMinHeight
+    const manifest = {
+      format: 'weltenbauer-solid',
+      version: 1,
+      mesh: 'island-carved.glb',
+      world: { sizeKm: this.config.size, seaLevel },
+      seed: this.advancedTerrainGenerator.getSeed(),
+      attributes: {
+        _SURFDATA: 'vec3 float per vertex — x = temperature (°C), y = humidity (0..1), z = surfaceHeight (m, terrain height of this column)'
+      },
+      depth: 'depthBelowSurface = _SURFDATA.z − vertexLocalY; ≈0 on the surface, larger on cut/cave walls (use it to shade interior strata)',
+      classification: { seaLevel, beachHeight: this.config.biome.beachHeight, blendMargin: this.config.biome.blendMargin },
+      recipe: 'Per fragment/sample: classify (surfaceHeight, _SURFDATA.x, _SURFDATA.y) into biome weights with the classification params + biomes legend (see docs/solid-export.md), then blend your own per-biome PBR materials; shade interior faces toward rock/bedrock by depth. Texture-agnostic — use our biomes or your own, or ignore them and shade straight from climate.',
+      biomes: BiomeSystem.legendBiomes()
+    }
+    return { glb, manifestJson: JSON.stringify(manifest, null, 2) }
+  }
+
+  // --- CSG carve tools (surface-aware digging) -----------------------------
+
+  /** Select the active carve tool. Selecting a tool also enters CSG mode. */
+  public setCsgTool(tool: CsgTool): void {
+    this.csgTool = tool
+    if (tool !== 'none') {
+      this.deselectCsgGizmo() // carving and gizmo editing are separate modes
+      if (!this.csgActive) this.enterCsgMode()
+      // Free left-drag for carving; orbit moves to right-drag while a tool is active.
+      this.controls.mouseButtons.LEFT = null as any
+      this.controls.mouseButtons.RIGHT = THREE.MOUSE.ROTATE
+    } else {
+      this.hideCsgGizmos()
+      this.restoreOrbitButtons()
+    }
+  }
+
+  private restoreOrbitButtons(): void {
+    this.controls.mouseButtons.LEFT = THREE.MOUSE.ROTATE
+    this.controls.mouseButtons.MIDDLE = THREE.MOUSE.DOLLY
+    this.controls.mouseButtons.RIGHT = THREE.MOUSE.PAN
+  }
+
+  public getCsgTool(): CsgTool {
+    return this.csgTool
+  }
+
+  public setCsgBrushSize(size: number): void {
+    this.csgBrushSize = Math.max(1, size)
+  }
+
+  public setCsgToolOperation(op: CsgOp): void {
+    this.csgToolOperation = op
+  }
+
+  /** Raycast the carved solid (BVH-accelerated) under an NDC point. */
+  private raycastCsg(ndcX: number, ndcY: number): { point: THREE.Vector3; normal: THREE.Vector3 } | null {
+    if (!this.csgMesh) return null
+    ;(this.csgRaycaster as any).firstHitOnly = true
+    this.csgRaycaster.setFromCamera(new THREE.Vector2(ndcX, ndcY), this.camera)
+    const hits = this.csgRaycaster.intersectObject(this.csgMesh, false)
+    if (hits.length === 0) return null
+
+    const hit = hits[0]
+    const normal = new THREE.Vector3(0, 1, 0)
+    if (hit.face) normal.copy(hit.face.normal).transformDirection(this.csgMesh.matrixWorld).normalize()
+    return { point: hit.point.clone(), normal }
+  }
+
+  /**
+   * Build cutter fields for a surface hit. The cutter is oriented to dig ALONG the
+   * surface normal (into the face) — so a cliff carves sideways, a flat top carves
+   * down, and an overhang underside carves up — and offset so it bites into the face.
+   */
+  private buildCutterForHit(point: THREE.Vector3, normal: THREE.Vector3): {
+    shape: CsgShape
+    position: [number, number, number]
+    rotation: [number, number, number]
+    scale: [number, number, number]
+    operation: CsgOp
+    worldCenter: THREE.Vector3
+    quat: THREE.Quaternion
+  } {
+    const s = this.csgBrushSize
+    const inDir = normal.clone().negate().normalize() // into the surface
+    const meshOffset = this.csgMesh ? this.csgMesh.position.y : 0
+
+    let shape: CsgShape
+    let scale: [number, number, number]
+    let localAxis: THREE.Vector3 | null
+    let offset: number
+
+    switch (this.csgTool) {
+      case 'tunnel':
+        shape = 'cylinder'; scale = [s, s * 3, s]; localAxis = new THREE.Vector3(0, 1, 0)
+        offset = s * 3 * 0.5 * 0.7
+        break
+      case 'chamber':
+        shape = 'box'; scale = [s * 2.5, s * 1.6, s * 2.5]; localAxis = new THREE.Vector3(0, 0, 1)
+        offset = s * 2.5 * 0.5
+        break
+      case 'dig':
+      default:
+        shape = 'sphere'; scale = [s, s, s]; localAxis = null
+        offset = s * 0.5 * 0.6
+        break
+    }
+
+    const worldCenter = point.clone().add(inDir.clone().multiplyScalar(offset))
+    const quat = new THREE.Quaternion()
+    let rotation: [number, number, number] = [0, 0, 0]
+    if (localAxis) {
+      quat.setFromUnitVectors(localAxis, inDir)
+      const e = new THREE.Euler().setFromQuaternion(quat)
+      rotation = [e.x, e.y, e.z]
+    }
+
+    return {
+      shape,
+      position: [worldCenter.x, worldCenter.y - meshOffset, worldCenter.z],
+      rotation,
+      scale,
+      operation: this.csgToolOperation,
+      worldCenter,
+      quat
+    }
+  }
+
+  /** Update the ghost preview + carve-axis arrow as the cursor moves over the solid. */
+  public csgPointerMove(ndcX: number, ndcY: number): void {
+    if (this.csgStroking) { this.handleStrokeMove(ndcX, ndcY); return }
+    if (this.csgTool === 'none' || !this.csgMesh) { this.hideCsgGizmos(); return }
+    const hit = this.raycastCsg(ndcX, ndcY)
+    if (!hit) { this.hideCsgGizmos(); return }
+
+    const cut = this.buildCutterForHit(hit.point, hit.normal)
+    this.ensureCsgGizmos()
+
+    const ghost = this.csgGhost!
+    if (this.csgGhostShape !== cut.shape) {
+      ghost.geometry.dispose()
+      ghost.geometry = cutterGeometry(cut.shape)
+      this.csgGhostShape = cut.shape
+    }
+    ghost.position.copy(cut.worldCenter)
+    ghost.quaternion.copy(cut.quat)
+    ghost.scale.set(cut.scale[0], cut.scale[1], cut.scale[2])
+    ghost.visible = true
+    ;(ghost.material as THREE.MeshBasicMaterial).color.set(this.csgToolOperation === 'add' ? 0x55cc66 : 0xff5544)
+
+    const arrow = this.csgAxisArrow!
+    arrow.position.copy(hit.point)
+    arrow.setDirection(hit.normal.clone().negate())
+    arrow.setLength(this.csgBrushSize * 1.6, this.csgBrushSize * 0.45, this.csgBrushSize * 0.28)
+    arrow.visible = true
+  }
+
+  /** Carve at the picked surface point: append a cutter to the stack and re-evaluate. */
+  public csgPointerCarve(ndcX: number, ndcY: number): void {
+    if (this.csgTool === 'none' || !this.csgMesh) return
+    const hit = this.raycastCsg(ndcX, ndcY)
+    if (!hit) return
+
+    const cut = this.buildCutterForHit(hit.point, hit.normal)
+    const op: CsgOperationDef = {
+      id: this.csgNextId++,
+      shape: cut.shape,
+      position: cut.position,
+      rotation: cut.rotation,
+      scale: cut.scale,
+      operation: cut.operation,
+      enabled: true
+    }
+    this.csgOperations.push(op)
+    this.appendEvaluateCsg(op) // incremental: cut just this dab, O(1) regardless of stack size
+    if (this.uiController && this.uiController.rebuildCsgOpsGui) this.uiController.rebuildCsgOpsGui()
+  }
+
+  // --- Drag-stroke Dig brush -----------------------------------------------
+
+  /**
+   * Begin a Dig stroke if the cursor is on the solid. Returns true if it consumed
+   * the press (only the 'dig' tool strokes; chamber/tunnel are click-to-place).
+   */
+  public csgPointerDown(ndcX: number, ndcY: number): boolean {
+    if (this.csgTool !== 'dig' || !this.csgMesh) return false
+    const hit = this.raycastCsg(ndcX, ndcY)
+    if (!hit) return false
+
+    this.csgStroking = true
+    this.csgStrokePoints = []
+    this.csgLastSampleWorld = null
+    this.addStrokeSample(hit.point, hit.normal)
+    this.updateStrokePreview()
+    if (this.csgGhost) this.csgGhost.visible = false
     return true
   }
 
-  private clearCsgDemo(): void {
-    if (!this.csgMesh) return
-    this.scene.remove(this.csgMesh)
-    this.csgMesh.geometry.dispose()
-    ;(this.csgMesh.material as THREE.Material).dispose()
-    this.csgMesh = null
+  private handleStrokeMove(ndcX: number, ndcY: number): void {
+    const hit = this.raycastCsg(ndcX, ndcY)
+    if (!hit) return
+
+    const spacing = this.csgBrushSize * 0.6 // overlap successive dabs into a continuous trench
+    if (
+      this.csgStrokePoints.length < this.csgStrokeMax &&
+      (!this.csgLastSampleWorld || hit.point.distanceTo(this.csgLastSampleWorld) >= spacing)
+    ) {
+      this.addStrokeSample(hit.point, hit.normal)
+      this.updateStrokePreview()
+    }
+
+    // Keep the carve-axis arrow live at the cursor.
+    this.ensureCsgGizmos()
+    const arrow = this.csgAxisArrow!
+    arrow.position.copy(hit.point)
+    arrow.setDirection(hit.normal.clone().negate())
+    arrow.setLength(this.csgBrushSize * 1.6, this.csgBrushSize * 0.45, this.csgBrushSize * 0.28)
+    arrow.visible = true
+  }
+
+  /** Finish the stroke: commit a single dab (1 sample) or a stroke op (many), then bake. */
+  public csgPointerUp(): void {
+    if (!this.csgStroking) return
+    this.csgStroking = false
+    this.clearStrokePreview()
+    if (this.csgAxisArrow) this.csgAxisArrow.visible = false
+
+    const pts = this.csgStrokePoints
+    this.csgStrokePoints = []
+    if (pts.length === 0) return
+
+    const s = this.csgBrushSize
+    const op: CsgOperationDef = pts.length === 1
+      ? { id: this.csgNextId++, shape: 'sphere', position: pts[0], rotation: [0, 0, 0], scale: [s, s, s], operation: this.csgToolOperation, enabled: true }
+      : { id: this.csgNextId++, shape: 'stroke', position: pts[0], rotation: [0, 0, 0], scale: [s, s, s], operation: this.csgToolOperation, enabled: true, points: pts }
+
+    this.csgOperations.push(op)
+    this.appendEvaluateCsg(op)
+    if (this.uiController && this.uiController.rebuildCsgOpsGui) this.uiController.rebuildCsgOpsGui()
+  }
+
+  /** Record a sphere center for the stroke: pick point pushed into the surface, in solid space. */
+  private addStrokeSample(point: THREE.Vector3, normal: THREE.Vector3): void {
+    const s = this.csgBrushSize
+    const inDir = normal.clone().negate().normalize()
+    const worldCenter = point.clone().add(inDir.multiplyScalar(s * 0.5 * 0.6))
+    const meshOffset = this.csgMesh ? this.csgMesh.position.y : 0
+    this.csgStrokePoints.push([worldCenter.x, worldCenter.y - meshOffset, worldCenter.z])
+    this.csgLastSampleWorld = point.clone()
+  }
+
+  private ensureStrokePreview(): void {
+    if (this.csgStrokePreview) return
+    const material = new THREE.MeshBasicMaterial({ color: 0xff5544, transparent: true, opacity: 0.3, depthWrite: false })
+    const inst = new THREE.InstancedMesh(cutterGeometry('sphere'), material, this.csgStrokeMax)
+    inst.count = 0
+    inst.frustumCulled = false
+    inst.renderOrder = 999
+    this.scene.add(inst)
+    this.csgStrokePreview = inst
+  }
+
+  private updateStrokePreview(): void {
+    this.ensureStrokePreview()
+    const inst = this.csgStrokePreview!
+    const s = this.csgBrushSize
+    const meshOffset = this.csgMesh ? this.csgMesh.position.y : 0
+    const m = new THREE.Matrix4()
+    const q = new THREE.Quaternion()
+    const scale = new THREE.Vector3(s, s, s)
+    const pos = new THREE.Vector3()
+    const n = Math.min(this.csgStrokePoints.length, this.csgStrokeMax)
+    for (let i = 0; i < n; i++) {
+      const p = this.csgStrokePoints[i]
+      pos.set(p[0], p[1] + meshOffset, p[2]) // back to world
+      m.compose(pos, q, scale)
+      inst.setMatrixAt(i, m)
+    }
+    inst.count = n
+    inst.instanceMatrix.needsUpdate = true
+    ;(inst.material as THREE.MeshBasicMaterial).color.set(this.csgToolOperation === 'add' ? 0x55cc66 : 0xff5544)
+    inst.visible = true
+  }
+
+  private clearStrokePreview(): void {
+    if (this.csgStrokePreview) { this.csgStrokePreview.count = 0; this.csgStrokePreview.visible = false }
+  }
+
+  // --- 3D gizmo editing of a single cutter ---------------------------------
+
+  private ensureGizmo(): void {
+    if (this.transformControls) return
+    const tc = new TransformControls(this.camera, this.renderer.domElement)
+    // Suspend orbit while dragging a handle; commit (re-bake) when the drag ends.
+    tc.addEventListener('dragging-changed', (e: any) => {
+      this.controls.enabled = !e.value
+      if (!e.value) this.commitGizmo()
+    })
+    tc.addEventListener('objectChange', () => this.updateGizmoGhost())
+    this.csgGizmoProxy = new THREE.Object3D()
+    this.scene.add(this.csgGizmoProxy)
+    this.scene.add(tc.getHelper())
+    this.transformControls = tc
+  }
+
+  /** Attach the move/rotate/scale gizmo to a single cutter op (not strokes). */
+  public selectCsgOperation(id: number): void {
+    const op = this.csgOperations.find(o => o.id === id)
+    if (!op || op.shape === 'stroke') return
+    this.ensureGizmo()
+    this.setCsgTool('none') // gizmo editing is its own mode (restores orbit; gizmo owns its handles)
+
+    const meshOffset = this.csgMesh ? this.csgMesh.position.y : 0
+    const p = this.csgGizmoProxy!
+    p.position.set(op.position[0], op.position[1] + meshOffset, op.position[2])
+    p.rotation.set(op.rotation[0], op.rotation[1], op.rotation[2])
+    p.scale.set(op.scale[0], op.scale[1], op.scale[2])
+    p.updateMatrixWorld()
+
+    this.transformControls.attach(p)
+    this.csgSelectedOpId = id
+    this.updateGizmoGhost()
+  }
+
+  public setGizmoMode(mode: 'translate' | 'rotate' | 'scale'): void {
+    if (this.transformControls) this.transformControls.setMode(mode)
+  }
+
+  /** The op currently attached to the gizmo, or null. */
+  public getCsgSelectedOpId(): number | null {
+    return this.csgSelectedOpId
+  }
+
+  public deselectCsgGizmo(): void {
+    if (this.transformControls) this.transformControls.detach()
+    this.csgSelectedOpId = null
+    if (this.csgGhost) this.csgGhost.visible = false
+  }
+
+  /** Write the gizmo proxy's transform back to the selected op and re-bake. */
+  private commitGizmo(): void {
+    if (this.csgSelectedOpId === null || !this.csgGizmoProxy) return
+    const op = this.csgOperations.find(o => o.id === this.csgSelectedOpId)
+    if (!op) return
+    const meshOffset = this.csgMesh ? this.csgMesh.position.y : 0
+    const p = this.csgGizmoProxy
+    const e = new THREE.Euler().setFromQuaternion(p.quaternion)
+    this.updateCsgOperation(this.csgSelectedOpId, {
+      position: [p.position.x, p.position.y - meshOffset, p.position.z],
+      rotation: [e.x, e.y, e.z],
+      scale: [p.scale.x, p.scale.y, p.scale.z]
+    })
+    if (this.uiController && this.uiController.rebuildCsgOpsGui) this.uiController.rebuildCsgOpsGui()
+  }
+
+  /** Keep the translucent cutter ghost matching the gizmo proxy while editing. */
+  private updateGizmoGhost(): void {
+    if (this.csgSelectedOpId === null || !this.csgGizmoProxy) return
+    const op = this.csgOperations.find(o => o.id === this.csgSelectedOpId)
+    if (!op || op.shape === 'stroke') return
+
+    this.ensureCsgGizmos()
+    const ghost = this.csgGhost!
+    const shape = op.shape as CsgShape
+    if (this.csgGhostShape !== shape) {
+      ghost.geometry.dispose()
+      ghost.geometry = cutterGeometry(shape)
+      this.csgGhostShape = shape
+    }
+    const p = this.csgGizmoProxy
+    ghost.position.copy(p.position)
+    ghost.quaternion.copy(p.quaternion)
+    ghost.scale.copy(p.scale)
+    ghost.visible = true
+    ;(ghost.material as THREE.MeshBasicMaterial).color.set(op.operation === 'add' ? 0x55cc66 : 0xff5544)
+  }
+
+  private ensureCsgGizmos(): void {
+    if (!this.csgGhost) {
+      const material = new THREE.MeshBasicMaterial({
+        color: 0xff5544, transparent: true, opacity: 0.35, depthWrite: false, side: THREE.DoubleSide
+      })
+      this.csgGhost = new THREE.Mesh(cutterGeometry('sphere'), material)
+      this.csgGhost.renderOrder = 999
+      this.csgGhostShape = 'sphere'
+      this.scene.add(this.csgGhost)
+    }
+    if (!this.csgAxisArrow) {
+      this.csgAxisArrow = new THREE.ArrowHelper(
+        new THREE.Vector3(0, -1, 0), new THREE.Vector3(), this.csgBrushSize * 1.6, 0xffdd33
+      )
+      this.scene.add(this.csgAxisArrow)
+    }
+  }
+
+  private hideCsgGizmos(): void {
+    if (this.csgGhost) this.csgGhost.visible = false
+    if (this.csgAxisArrow) this.csgAxisArrow.visible = false
   }
 
   /**
@@ -2244,6 +2994,7 @@ export class TerrainBuilder {
    * Returns null until a terrain has been generated.
    */
   public getMapSetExport(): MapSetExport | null {
+    this.syncHeightFromBrush() // exports should reflect brush edits
     if (!this.lastHeightData) return null
     if (!this.climateFields) this.computeClimateFields()
     if (!this.biomeField) this.computeBiomeField()
@@ -2350,7 +3101,9 @@ export class TerrainBuilder {
     
     // Clean up terrain material
     this.terrainMaterial.dispose()
-    
+    if (this.csgSolidMaterial) { this.csgSolidMaterial.dispose(); this.csgSolidMaterial = null }
+    if (this.csgDebugMaterial) { this.csgDebugMaterial.dispose(); this.csgDebugMaterial = null }
+
     // Clean up preview canvas
     if (this.noisePreviewCanvas && this.noisePreviewCanvas.parentNode) {
       document.body.removeChild(this.noisePreviewCanvas)

@@ -10,7 +10,12 @@
       "Bash(node -e \"const p=require\\('./node_modules/three/package.json'\\); console.log\\(JSON.stringify\\(p.exports['./tsl'],null,2\\)\\)\")",
       "WebSearch",
       "Bash(cd *)",
-      "Bash(xargs grep -l \"DataArrayTexture\\\\|CompressedArrayTexture\\\\|Data3DTexture\\\\|\\\\.depth\\(\")"
+      "Bash(xargs grep -l \"DataArrayTexture\\\\|CompressedArrayTexture\\\\|Data3DTexture\\\\|\\\\.depth\\(\")",
+      "WebFetch(domain:api.github.com)",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "Bash(node -e \"const e=require\\('./node_modules/three-mesh-bvh/package.json'\\).exports; console.log\\(JSON.stringify\\(e,null,1\\)\\)\")",
+      "Bash(node -e \"const t=require\\('./node_modules/@types/three/src/Three.WebGPU.d.ts'\\)\")",
+      "Bash(npx vite *)"
     ]
   }
 }

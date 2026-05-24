@@ -1,6 +1,7 @@
 import { GUI } from 'lil-gui'
-import { TerrainBuilder, EditorMode } from '../core/TerrainBuilder'
+import { TerrainBuilder, EditorMode, CsgTool } from '../core/TerrainBuilder'
 import { BrushMode } from '../core/BrushSystem'
+import { CsgOp } from '../core/CsgSystem'
 import { ClimateView } from '../core/ClimateSystem'
 import { ProgressOverlay } from './ProgressOverlay'
 import { zipSync, Zippable } from 'fflate'
@@ -26,6 +27,9 @@ export class UIController {
   private isPointerDown = false
   private pendingCursorEvent: MouseEvent | null = null
   private cursorRafScheduled = false
+  private csgDownX = 0
+  private csgDownY = 0
+  private csgConsumed = false // a Dig stroke is in progress (vs an orbit/click)
 
   // UI state objects for lil-gui
   private terrainParams = {
@@ -76,8 +80,24 @@ export class UIController {
 
   private csgParams = {
     undergroundDepth: 60,
-    runDemo: () => this.runCsgDemo()
+    tool: 'none',
+    toolOperation: 'subtract',
+    brushSize: 40,
+    toggleCsg: () => this.toggleCsg(),
+    addSphere: () => this.addCsgCutter('sphere'),
+    addBox: () => this.addCsgCutter('box'),
+    addCylinder: () => this.addCsgCutter('cylinder'),
+    clearCutters: () => { this.terrainBuilder.clearCsgOperations(); this.rebuildCsgOpsGui() },
+    commitGLB: () => this.exportCarvedMeshGLB(),
+    sdfRes: 128,
+    exportSdf: () => this.exportSdf(),
+    gizmoMove: () => this.terrainBuilder.setGizmoMode('translate'),
+    gizmoRotate: () => this.terrainBuilder.setGizmoMode('rotate'),
+    gizmoScale: () => this.terrainBuilder.setGizmoMode('scale'),
+    gizmoDeselect: () => { this.terrainBuilder.deselectCsgGizmo(); this.rebuildCsgOpsGui() }
   }
+  private csgFolder: any = null
+  private csgOpFolders: any[] = []
 
   private brushParams = {
     mode: 'raise' as BrushMode,
@@ -455,14 +475,56 @@ export class UIController {
     biomeFolder.add({ exportBiomes: () => this.exportBiomes() }, 'exportBiomes')
       .name('📦 Export Biome Data')
 
-    // CSG (experimental) folder — heightfield → solid + boolean carving
+    // CSG (experimental) folder — solidify the terrain + non-destructive cutter stack
     const csgFolder = this.gui.addFolder('CSG (experimental)')
+    this.csgFolder = csgFolder
+
+    csgFolder.add(this.csgParams, 'toggleCsg')
+      .name('▶ Enter / Exit CSG')
 
     csgFolder.add(this.csgParams, 'undergroundDepth', 0, 300, 5)
       .name('Underground Depth (m)')
+      .onChange((v: number) => this.terrainBuilder.setCsgUndergroundDepth(v))
 
-    csgFolder.add(this.csgParams, 'runDemo')
-      .name('🧱 Solidify + Carve (demo)')
+    // Surface-aware carve tools: pick a tool, then click the terrain to dig
+    // INTO the face you're pointing at (cliffs carve sideways, overhangs carve up).
+    csgFolder.add(this.csgParams, 'tool', {
+      'Off (orbit)': 'none',
+      'Dig (sphere)': 'dig',
+      'Chamber (box)': 'chamber',
+      'Tunnel (cylinder)': 'tunnel'
+    })
+      .name('⛏️ Carve Tool')
+      .onChange((v: CsgTool) => {
+        this.terrainBuilder.setCsgTool(v)
+        // Picking a carve tool deselects any gizmo — refresh rows so a stale
+        // "Stop editing" label reverts to "Edit".
+        if (v !== 'none') this.rebuildCsgOpsGui()
+      })
+
+    csgFolder.add(this.csgParams, 'toolOperation', { 'Subtract (dig)': 'subtract', 'Add (build out)': 'add' })
+      .name('Mode')
+      .onChange((v: CsgOp) => this.terrainBuilder.setCsgToolOperation(v))
+
+    csgFolder.add(this.csgParams, 'brushSize', 5, 200, 1)
+      .name('Carve Size')
+      .onChange((v: number) => this.terrainBuilder.setCsgBrushSize(v))
+
+    csgFolder.add(this.csgParams, 'addSphere').name('+ Sphere cutter')
+    csgFolder.add(this.csgParams, 'addBox').name('+ Box cutter')
+    csgFolder.add(this.csgParams, 'addCylinder').name('+ Cylinder cutter')
+    csgFolder.add(this.csgParams, 'clearCutters').name('🗑 Clear cutters')
+
+    // Gizmo: hit 🎯 Edit in a cutter's row, then move/rotate/scale it in 3D. These
+    // buttons set the active gizmo's mode (also W/E/R; Esc stops). Rotation only
+    // shows on box/cylinder cutters — a sphere looks the same when rotated.
+    csgFolder.add(this.csgParams, 'gizmoMove').name('Gizmo: Move (W)')
+    csgFolder.add(this.csgParams, 'gizmoRotate').name('Gizmo: Rotate (E)')
+    csgFolder.add(this.csgParams, 'gizmoScale').name('Gizmo: Scale (R)')
+    csgFolder.add(this.csgParams, 'gizmoDeselect').name('Gizmo: Deselect (Esc)')
+    csgFolder.add(this.csgParams, 'commitGLB').name('📦 Commit → glTF + data (.zip)')
+    csgFolder.add(this.csgParams, 'sdfRes', { '64³': 64, '128³': 128, '256³': 256 }).name('SDF Resolution')
+    csgFolder.add(this.csgParams, 'exportSdf').name('🧊 Export SDF Volume (.zip)')
 
     // Brush Tools folder
     const brushFolder = this.gui.addFolder('Brush Tools')
@@ -689,6 +751,17 @@ export class UIController {
   private setupCanvasEvents(): void {
     this.canvas.addEventListener('mousedown', (event) => {
       this.isPointerDown = true
+      this.csgDownX = event.clientX
+      this.csgDownY = event.clientY
+
+      if (this.terrainBuilder.getCsgTool() !== 'none') {
+        // Left-drag carves (Dig strokes); right-drag is orbit (OrbitControls).
+        if (event.button === 0) {
+          const ndc = this.ndcFromEvent(event)
+          this.csgConsumed = this.terrainBuilder.csgPointerDown(ndc.x, ndc.y)
+        }
+        return
+      }
       this.terrainBuilder.getBrushSystem().handleMouseDown(
         event,
         this.terrainBuilder.getCamera(),
@@ -697,6 +770,12 @@ export class UIController {
     })
 
     this.canvas.addEventListener('mousemove', (event) => {
+      // Carve tools: live ghost / stroke preview on the carved solid.
+      if (this.terrainBuilder.getCsgTool() !== 'none') {
+        const ndc = this.ndcFromEvent(event)
+        this.terrainBuilder.csgPointerMove(ndc.x, ndc.y)
+        return
+      }
       this.terrainBuilder.getBrushSystem().handleMouseMove(
         event,
         this.terrainBuilder.getCamera(),
@@ -707,6 +786,24 @@ export class UIController {
 
     this.canvas.addEventListener('mouseup', (event) => {
       this.isPointerDown = false
+
+      if (this.terrainBuilder.getCsgTool() !== 'none') {
+        if (event.button === 0) {
+          if (this.csgConsumed) {
+            this.terrainBuilder.csgPointerUp() // commit the Dig stroke/dab
+          } else {
+            // Chamber/Tunnel: a click (not a drag-to-orbit) places one cutter.
+            const moved = Math.hypot(event.clientX - this.csgDownX, event.clientY - this.csgDownY)
+            if (moved < 5) {
+              const ndc = this.ndcFromEvent(event)
+              this.terrainBuilder.csgPointerCarve(ndc.x, ndc.y)
+            }
+          }
+          this.csgConsumed = false
+        }
+        return
+      }
+
       this.terrainBuilder.getBrushSystem().handleMouseUp()
       this.scheduleCursorUpdate(event) // refresh once after the drag ends
     })
@@ -715,6 +812,15 @@ export class UIController {
     window.addEventListener('mouseup', () => {
       this.isPointerDown = false
     })
+  }
+
+  /** Convert a mouse event to normalized device coordinates over the canvas. */
+  private ndcFromEvent(event: MouseEvent): { x: number; y: number } {
+    const rect = this.canvas.getBoundingClientRect()
+    return {
+      x: ((event.clientX - rect.left) / rect.width) * 2 - 1,
+      y: -((event.clientY - rect.top) / rect.height) * 2 + 1
+    }
   }
 
   /**
@@ -860,14 +966,150 @@ export class UIController {
     }
   }
 
-  /** Run (or toggle off) the Stage-1 CSG solidify + carve demo. */
-  private runCsgDemo(): void {
+  /** Enter/exit CSG mode (solidify the terrain + show the carved result). */
+  private toggleCsg(): void {
     try {
-      const showing = this.terrainBuilder.runCsgDemo(this.csgParams.undergroundDepth)
-      console.log(showing ? 'CSG demo: showing carved solid' : 'CSG demo: restored terrain')
+      if (this.terrainBuilder.isCsgActive()) {
+        this.terrainBuilder.exitCsgMode()
+        this.csgParams.tool = 'none' // exit also clears the active tool
+        this.updateGUIDisplay()
+      } else {
+        this.terrainBuilder.enterCsgMode()
+      }
     } catch (error) {
-      console.error('CSG demo failed:', error)
-      alert('CSG demo failed — see console for details.')
+      console.error('CSG toggle failed:', error)
+      alert('CSG failed — see console for details.')
+    }
+  }
+
+  /** Commit/bake the carved terrain to a .glb (with `_SURFDATA`) + JSON contract, zipped. */
+  private async exportCarvedMeshGLB(): Promise<void> {
+    try {
+      const result = await this.terrainBuilder.exportCarvedSolid()
+      if (!result) {
+        alert('Enter CSG mode and carve something before committing to glTF.')
+        return
+      }
+      const entries: Zippable = {
+        'island-carved.glb': new Uint8Array(result.glb),
+        'solid.json': new TextEncoder().encode(result.manifestJson)
+      }
+      const zipped = zipSync(entries)
+      const url = URL.createObjectURL(new Blob([zipped.buffer as ArrayBuffer], { type: 'application/zip' }))
+      this.downloadFile(url, 'island-carved.zip')
+      URL.revokeObjectURL(url)
+    } catch (error) {
+      console.error('Failed to export carved mesh:', error)
+      alert('Failed to export carved mesh. See console for details.')
+    }
+  }
+
+  /** Select a cutter for gizmo editing (selecting also drops the carve tool). */
+  private editCsgOp(id: number): void {
+    this.terrainBuilder.selectCsgOperation(id)
+    this.csgParams.tool = 'none' // selecting a gizmo switches off the carve tool
+    this.updateGUIDisplay()
+    this.rebuildCsgOpsGui() // refresh so this row shows "Stop editing" (and others "Edit")
+  }
+
+  /** Stop gizmo editing the currently-selected cutter. */
+  private stopEditCsgOp(): void {
+    this.terrainBuilder.deselectCsgGizmo()
+    this.rebuildCsgOpsGui()
+  }
+
+  /** Bake + download the carved terrain's signed-distance volume (raw .bin + JSON) as a zip. */
+  private async exportSdf(): Promise<void> {
+    const po = this.progressOverlay
+    try {
+      po.startTask('sdf-bake', 'Baking SDF volume', 'Sampling distances…')
+      const result = await this.terrainBuilder.exportSdfVolume(
+        this.csgParams.sdfRes,
+        (f) => po.updateTask('sdf-bake', Math.round(f * 100), `Sampling distances… ${Math.round(f * 100)}%`)
+      )
+      po.completeTask('sdf-bake')
+
+      if (!result) {
+        alert('Enter CSG mode and carve something before exporting an SDF.')
+        return
+      }
+
+      const entries: Zippable = {
+        'sdf.json': new TextEncoder().encode(result.json),
+        'sdf.bin': new Uint8Array(result.bin)
+      }
+      const zipped = zipSync(entries)
+      const url = URL.createObjectURL(new Blob([zipped.buffer as ArrayBuffer], { type: 'application/zip' }))
+      this.downloadFile(url, 'island-sdf.zip')
+      URL.revokeObjectURL(url)
+    } catch (error) {
+      po.completeTask('sdf-bake')
+      console.error('Failed to export SDF volume:', error)
+      alert('Failed to export SDF volume. See console for details.')
+    }
+  }
+
+  private addCsgCutter(shape: 'sphere' | 'box' | 'cylinder'): void {
+    try {
+      this.terrainBuilder.addCsgOperation(shape)
+      this.rebuildCsgOpsGui()
+    } catch (error) {
+      console.error('Add cutter failed:', error)
+      alert('Add cutter failed — see console for details.')
+    }
+  }
+
+  /** Rebuild the per-cutter GUI subfolders from the current operation stack. */
+  public rebuildCsgOpsGui(): void {
+    this.csgOpFolders.forEach(f => f.destroy())
+    this.csgOpFolders = []
+    if (!this.csgFolder) return
+
+    const bounds = this.terrainBuilder.getCsgBounds()
+    const posRange = bounds.size / 2
+    const scaleMax = Math.max(10, bounds.size)
+
+    for (const op of this.terrainBuilder.getCsgOperations()) {
+      const isStroke = op.shape === 'stroke'
+      const label = isStroke ? `#${op.id} stroke (${op.points?.length ?? 0} dabs)` : `#${op.id} ${op.shape}`
+      const folder = this.csgFolder.addFolder(label)
+      this.csgOpFolders.push(folder)
+
+      const model = {
+        operation: op.operation,
+        enabled: op.enabled,
+        posX: op.position[0], posY: op.position[1], posZ: op.position[2],
+        rotY: (op.rotation[1] * 180) / Math.PI,
+        scaleX: op.scale[0], scaleY: op.scale[1], scaleZ: op.scale[2],
+        remove: () => { this.terrainBuilder.removeCsgOperation(op.id); this.rebuildCsgOpsGui() }
+      }
+
+      // Re-bake only on release (onFinishChange), since each evaluation is a CSG bake.
+      const apply = () => this.terrainBuilder.updateCsgOperation(op.id, {
+        operation: model.operation as 'subtract' | 'add' | 'intersect',
+        enabled: model.enabled,
+        position: [model.posX, model.posY, model.posZ],
+        rotation: [0, (model.rotY * Math.PI) / 180, 0],
+        scale: [model.scaleX, model.scaleY, model.scaleZ]
+      })
+
+      folder.add(model, 'operation', ['subtract', 'add', 'intersect']).name('Operation').onChange(apply)
+      folder.add(model, 'enabled').name('Enabled').onChange(apply)
+
+      // Strokes are a baked path — only operation/enable/remove make sense to edit.
+      if (!isStroke) {
+        const editing = this.terrainBuilder.getCsgSelectedOpId() === op.id
+        folder.add({ toggle: () => editing ? this.stopEditCsgOp() : this.editCsgOp(op.id) }, 'toggle')
+          .name(editing ? '🛑 Stop editing (gizmo)' : '🎯 Edit (gizmo)')
+        folder.add(model, 'posX', -posRange, posRange, 1).name('Pos X').onFinishChange(apply)
+        folder.add(model, 'posY', bounds.minHeight - 100, bounds.maxHeight + 100, 1).name('Pos Y (height)').onFinishChange(apply)
+        folder.add(model, 'posZ', -posRange, posRange, 1).name('Pos Z').onFinishChange(apply)
+        folder.add(model, 'rotY', 0, 360, 1).name('Yaw (°)').onFinishChange(apply)
+        folder.add(model, 'scaleX', 1, scaleMax, 1).name('Scale X').onFinishChange(apply)
+        folder.add(model, 'scaleY', 1, scaleMax, 1).name('Scale Y').onFinishChange(apply)
+        folder.add(model, 'scaleZ', 1, scaleMax, 1).name('Scale Z').onFinishChange(apply)
+      }
+      folder.add(model, 'remove').name('🗑 Remove')
     }
   }
 
