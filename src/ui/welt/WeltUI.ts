@@ -57,6 +57,7 @@ export class WeltUI {
   private csgConsumed = false
   private pendingCursorEvent: MouseEvent | null = null
   private cursorRafScheduled = false
+  private tileRefreshScheduled = false
 
   constructor(terrainBuilder: TerrainBuilder) {
     this.tb = terrainBuilder
@@ -175,6 +176,54 @@ export class WeltUI {
   private renderTerrain(): void {
     const c = this.tb.getConfig()
 
+    // Island size sits up top — it frames everything below (tiles, generation).
+    this.add(slider({ label: 'Size', min: 0.1, max: 20, step: 0.1, value: c.size, unit: 'km', onChange: v => this.tb.updateConfig({ size: v }) }))
+
+    // Representation: smooth mesh vs the coarse low-poly square grid or hex tiles.
+    const style = this.tb.getTerrainStyle()
+    this.add(select<'smooth' | 'grid' | 'hex'>({
+      label: 'Representation', value: style,
+      options: [
+        { label: 'Smooth', value: 'smooth' },
+        { label: 'Square grid', value: 'grid' },
+        { label: 'Hex tiles', value: 'hex' }
+      ],
+      onChange: v => { this.tb.setTerrainStyle(v); this.renderStage() }
+    }))
+    if (style !== 'smooth') {
+      const isHex = style === 'hex'
+      const sizeMode = this.tb.getGridSizeMode()
+      this.add(select<'count' | 'diameter'>({
+        label: 'Tile sizing', value: sizeMode,
+        options: [{ label: 'By count', value: 'count' }, { label: 'By size', value: 'diameter' }],
+        onChange: v => { this.tb.setGridSizeMode(v); this.renderStage() }
+      }))
+      if (sizeMode === 'count') {
+        this.add(slider({ label: 'Tiles across', min: 4, max: 400, step: 1, value: this.tb.getGridCells(), onChange: v => this.tb.setGridCells(v) }))
+      } else {
+        // 'By size': show what the target actually resolves to, flagging the tile cap.
+        const note = hint('')
+        const updateNote = () => {
+          const info = this.tb.getTileSizingInfo()
+          note.textContent = info.capped
+            ? `⚠ Capped at 400 tiles — actual tile size ≈ ${Math.round(info.effectiveDiameter)} m (bigger than requested on an island this large).`
+            : `→ ${info.cells} tiles across.`
+        }
+        this.add(slider({
+          label: 'Tile size', min: 5, max: 500, step: 1, unit: 'm', value: this.tb.getGridTileDiameter(),
+          onChange: v => { this.tb.setGridTileDiameter(v); updateNote() }
+        }), note)
+        updateNote()
+      }
+      this.add(
+        slider({ label: 'Height step', min: 0, max: 50, step: 1, value: this.tb.getGridStep(), unit: 'm', onChange: v => this.tb.setGridStep(v) }),
+        hint((isHex
+          ? 'Hex tiles: each is a centre fanned to 6 corners; shared corners sample the same height, so joins are seamless. '
+          : 'Square grid: each cell’s tilt comes from its 4 shared corner heights. ')
+          + 'By size fixes the tile diameter (metres) so different islands share the same tile size. Height step = 0 is continuous; raise it for terraced steps.')
+      )
+    }
+
     this.add(
       button({ label: '🎲 Randomize seed', kind: 'primary', full: true, onClick: () => { this.tb.randomizeSeed(); this.renderStage() } }),
       fileButton({ label: '📁 Import heightmap (PNG)', accept: 'image/*', onFile: f => this.importHeightmap(f) }),
@@ -216,13 +265,12 @@ export class WeltUI {
     presets.body.append(
       button({ label: '🏔 Alaskan / Everest', full: true, onClick: () => this.applyMountainPreset('alaskan') }),
       button({ label: '🏜 Nevada / New Mexico', full: true, onClick: () => this.applyMountainPreset('desert') }),
-      button({ label: '🌧 Gentle erosion', full: true, onClick: () => this.tb.applyGentleErosion() }),
+      button({ label: '🌧 Gentle erosion', full: true, onClick: () => { this.tb.applyGentleErosion(); this.tb.refreshTileMesh() } }),
       button({ label: '🏞 Create river', full: true, onClick: () => this.createRiver() })
     )
 
     const adv = group('Generation parameters', {})
     adv.body.append(
-      slider({ label: 'Size', min: 1, max: 20, step: 1, value: c.size, unit: 'km', onChange: v => this.tb.updateConfig({ size: v }) }),
       select<number>({
         label: 'Resolution', value: c.resolution,
         options: [64, 128, 256, 512, 1024, 2048, 4096].map(r => ({ label: `${r}×${r}`, value: r })),
@@ -444,6 +492,8 @@ export class WeltUI {
       hint('Exact heightfield + config; re-import to keep editing.'),
       button({ label: '📦 Carved solid — .zip (glTF + data)', full: true, onClick: () => this.exportCarvedMeshGLB() }),
       hint('The 3D carved mesh with _SURFDATA + the biome contract. Carve something first.'),
+      button({ label: '🧩 Tile solid — .zip (glTF + data)', full: true, onClick: () => this.exportTileSolid() }),
+      hint('The low-poly square/hex tiles as a closed, flat-bottomed solid (tiny files). Switch the Terrain representation to a tile mode first.'),
       button({ label: '🌿 Biome data — files', full: true, onClick: () => this.exportBiomes() }),
       button({ label: 'Heightmap PNG (legacy)', kind: 'ghost', full: true, onClick: () => this.exportHeightmap() })
     )
@@ -467,6 +517,7 @@ export class WeltUI {
   private createRiver(): void {
     const size = this.tb.getConfig().size * 1000
     this.tb.createRiver(-size * 0.3, size * 0.2, size * 0.3, -size * 0.2)
+    this.tb.refreshTileMesh()
   }
 
   private importHeightmap(file: File): void {
@@ -545,6 +596,20 @@ export class WeltUI {
     } catch (e) { console.error('Carved export failed:', e); alert('Failed to export carved mesh. See console.') }
   }
 
+  private async exportTileSolid(): Promise<void> {
+    try {
+      const result = await this.tb.exportTileSolid()
+      if (!result) {
+        alert('Switch the Terrain representation to Square grid or Hex tiles first.')
+        return
+      }
+      this.downloadBlob(zipSync({
+        'island-tiles.glb': new Uint8Array(result.glb),
+        'solid.json': new TextEncoder().encode(result.manifestJson)
+      }), 'island-tiles.zip', 'application/zip')
+    } catch (e) { console.error('Tile solid export failed:', e); alert('Failed to export tile solid. See console.') }
+  }
+
   private async exportSdf(res: number): Promise<void> {
     const po = this.progressOverlay
     try {
@@ -598,6 +663,7 @@ export class WeltUI {
       if (this.tb.getCsgTool() !== 'none') { const n = this.ndc(e); this.tb.csgPointerMove(n.x, n.y); return }
       this.tb.getBrushSystem().handleMouseMove(e, this.tb.getCamera(), this.canvas)
       this.scheduleCursorUpdate(e)
+      if (this.isPointerDown) this.scheduleTileRefresh() // live tile update while sculpting
     })
     this.canvas.addEventListener('mouseup', (e) => {
       this.isPointerDown = false
@@ -611,8 +677,19 @@ export class WeltUI {
       }
       this.tb.getBrushSystem().handleMouseUp()
       this.scheduleCursorUpdate(e)
+      this.tb.refreshTileMesh(false) // stroke end: full refresh (re-derives climate → correct colours)
     })
     window.addEventListener('mouseup', () => { this.isPointerDown = false })
+  }
+
+  /** Live tile rebuild during a sculpt stroke, throttled to one per animation frame. */
+  private scheduleTileRefresh(): void {
+    if (this.tileRefreshScheduled) return
+    this.tileRefreshScheduled = true
+    requestAnimationFrame(() => {
+      this.tileRefreshScheduled = false
+      this.tb.refreshTileMesh(true) // live: geometry from latest heights, climate reused
+    })
   }
 
   private ndc(e: MouseEvent): { x: number; y: number } {

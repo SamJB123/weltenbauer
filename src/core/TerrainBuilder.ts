@@ -9,6 +9,11 @@ import { TerrainMaterial } from './TerrainMaterial'
 import { ClimateSystem, ClimateFields, ClimateView, TEMPERATURE_DISPLAY_MIN, TEMPERATURE_DISPLAY_MAX } from './ClimateSystem'
 import { BiomeSystem, BiomeField, BIOMES } from './BiomeSystem'
 import { buildSolidGeometry, evaluateOperations, applyOperation, cutterGeometry, CsgOperationDef, CsgShape, CsgOp, SurfaceSampler } from './CsgSystem'
+import { buildGridGeometry, buildHexGeometry, solidifyTileGeometry } from './GridTerrain'
+
+/** Max tiles across for the low-poly representations, so a tiny tile size on a large
+ *  island can't explode the mesh. Surfaced in the UI when 'by size' hits this. */
+const GRID_MAX_CELLS = 400
 import { computeBoundsTree, disposeBoundsTree, acceleratedRaycast } from 'three-mesh-bvh'
 
 // Accelerate raycasts against carved CSG meshes so the Dig tools can pick any 3D
@@ -122,6 +127,21 @@ export class TerrainBuilder {
   // The solid's biome material: classifies per-fragment from the carried `surfData`,
   // double-sided for cave interiors. Created lazily, reused across carves.
   private csgSolidMaterial: TerrainMaterial | null = null
+
+  // Low-poly grid (RollerCoaster-Tycoon-style) preview: a coarse shared-vertex
+  // heightfield shown in place of the smooth terrain. Separate mesh, like CSG.
+  private gridMesh: THREE.Mesh | null = null
+  // Tiles classify biomes per-fragment from the carried climate (continuous, not
+  // baked) — same material approach as the CSG solid, flat-shaded for the facets.
+  private gridClassifyMaterial: TerrainMaterial | null = null
+  private gridDebugMaterial: THREE.MeshStandardMaterial | null = null
+  private terrainStyle: 'smooth' | 'grid' | 'hex' = 'smooth'
+  private gridCells = 48          // tiles across (count mode)
+  private gridStep = 0
+  // Alternative sizing: fix the tile DIAMETER (metres) so islands of different sizes
+  // share the same-sized tiles. 'count' uses gridCells; 'diameter' derives the count.
+  private gridSizeMode: 'count' | 'diameter' = 'count'
+  private gridTileDiameter = 50
   // Double-sided vertex-color material for the solid's flat debug views
   // (temperature / humidity / biome palette), mirroring the flat terrain.
   private csgDebugMaterial: THREE.MeshStandardMaterial | null = null
@@ -1658,6 +1678,9 @@ export class TerrainBuilder {
     this.terrain.castShadow = false  // Disable terrain self-shadowing to prevent artifacts
     this.scene.add(this.terrain)
 
+    // If the low-poly grid representation is active, rebuild it from the fresh terrain.
+    if (this.terrainStyle === 'grid') this.rebuildGridMesh()
+
     // Update grid position to align with terrain center
     if (this.gridHelper) {
       this.gridHelper.position.y = -avgHeight * 0.5 - 0.1 // Slightly below terrain center
@@ -1838,6 +1861,7 @@ export class TerrainBuilder {
     this.config.climate.viewMode = mode
     this.applyViewMode()
     if (this.csgActive) this.applyCsgViewMode() // carry the view through to the solid
+    if (this.terrainStyle !== 'smooth') this.applyGridViewMode() // …and to the tiles
   }
 
   /**
@@ -2287,7 +2311,13 @@ export class TerrainBuilder {
     this.clearStrokePreview()
     this.restoreOrbitButtons()
     this.clearCsgDemo()
-    if (this.terrain) this.terrain.visible = true
+    // Return to whatever representation was active: tiles if in a tile style, else the smooth terrain.
+    if (this.terrainStyle !== 'smooth' && this.gridMesh) {
+      this.gridMesh.visible = true
+      if (this.terrain) this.terrain.visible = false
+    } else if (this.terrain) {
+      this.terrain.visible = true
+    }
     if (this.waterPlane) this.waterPlane.visible = true
   }
 
@@ -2389,10 +2419,26 @@ export class TerrainBuilder {
     this.csgSurfaceHum = topHum ?? null
 
     if (this.csgBaseSolid) this.csgBaseSolid.dispose()
-    this.csgBaseSolid = buildSolidGeometry(data, res, {
-      size, seaLevel, undergroundDepth: this.csgUndergroundDepth,
-      topTemperature: topTemp, topHumidity: topHum
-    })
+    // Recreate the carved material next paint so its flat-shading matches the style.
+    if (this.csgSolidMaterial) { this.csgSolidMaterial.dispose(); this.csgSolidMaterial = null }
+
+    if (this.terrainStyle !== 'smooth') {
+      // Carve the SAME tiling that's displayed: build the tile top, then solidify it.
+      // So a hex map carves a hex-bordered solid, not the square heightfield.
+      const tileOpts = { cells: this.effectiveCells(), sizeUnits: size, step: this.gridStep }
+      const tT = this.climateFields?.temperature ?? null
+      const tH = this.climateFields?.humidity ?? null
+      const top = this.terrainStyle === 'hex'
+        ? buildHexGeometry(this.lastHeightData, res0, tT, tH, tileOpts)
+        : buildGridGeometry(this.lastHeightData, res0, tT, tH, tileOpts)
+      this.csgBaseSolid = solidifyTileGeometry(top, this.csgUndergroundDepth)
+      top.dispose()
+    } else {
+      this.csgBaseSolid = buildSolidGeometry(data, res, {
+        size, seaLevel, undergroundDepth: this.csgUndergroundDepth,
+        topTemperature: topTemp, topHumidity: topHum
+      })
+    }
   }
 
   private csgSurface(): SurfaceSampler {
@@ -2442,8 +2488,11 @@ export class TerrainBuilder {
     if (!this.csgSolidMaterial) {
       // Share the flat terrain's loaded textures so the solid's node graph binds the
       // real textures (a fresh instance races its own async loads → purple fallback).
+      // Flat-shade when carving a tile representation, to keep the low-poly facets.
       this.csgSolidMaterial = new TerrainMaterial({
-        classifyFromSurfData: true, doubleSide: true, shareTexturesFrom: this.terrainMaterial
+        classifyFromSurfData: true, doubleSide: true,
+        flatShading: this.terrainStyle !== 'smooth',
+        shareTexturesFrom: this.terrainMaterial
       })
       this.csgSolidMaterial.setBiomeBlend(1)
     }
@@ -2458,6 +2507,7 @@ export class TerrainBuilder {
     this.applyCsgViewMode() // honor the active climate/biome view on the solid
 
     if (this.terrain) this.terrain.visible = false
+    if (this.gridMesh) this.gridMesh.visible = false // tile preview gives way to the carved solid
     if (this.waterPlane) this.waterPlane.visible = false
   }
 
@@ -2470,16 +2520,27 @@ export class TerrainBuilder {
    */
   private applyCsgViewMode(): void {
     if (!this.csgMesh || !this.csgSolidMaterial) return
-    const mode = this.config.climate.viewMode
+    if (!this.csgDebugMaterial) {
+      this.csgDebugMaterial = new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 1.0, metalness: 0.0, side: THREE.DoubleSide })
+    }
+    this.applyViewToMesh(this.csgMesh, this.csgSolidMaterial, this.csgDebugMaterial)
+  }
 
+  /**
+   * Apply the active climate view to a surfData-carrying mesh (carved solid or tiles).
+   * normal/biome use the classify material (continuous biome from climate); temperature/
+   * humidity/biomeColor compute a flat per-vertex colour from surfData on the debug
+   * material. No biome is ever baked — colours are derived from the carried climate.
+   */
+  private applyViewToMesh(mesh: THREE.Mesh, classifyMat: TerrainMaterial, debugMat: THREE.Material): void {
+    const mode = this.config.climate.viewMode
     if (mode === 'normal' || mode === 'biome') {
-      this.csgSolidMaterial.setBiomeBlend(mode === 'biome' ? 1 : 0)
-      this.csgMesh.material = this.csgSolidMaterial.getMaterial()
+      classifyMat.setBiomeBlend(mode === 'biome' ? 1 : 0)
+      mesh.material = classifyMat.getMaterial()
       return
     }
 
-    // Flat debug views — compute a per-vertex colour from the geometry's surfData.
-    const geo = this.csgMesh.geometry as THREE.BufferGeometry
+    const geo = mesh.geometry as THREE.BufferGeometry
     const sd = geo.getAttribute('surfData')
     if (!sd) return
     const n = sd.count
@@ -2502,12 +2563,7 @@ export class TerrainBuilder {
     }
 
     geo.setAttribute('color', new THREE.BufferAttribute(colors, 3))
-    if (!this.csgDebugMaterial) {
-      this.csgDebugMaterial = new THREE.MeshStandardMaterial({
-        vertexColors: true, roughness: 1.0, metalness: 0.0, side: THREE.DoubleSide
-      })
-    }
-    this.csgMesh.material = this.csgDebugMaterial
+    mesh.material = debugMat
   }
 
   /** Tear down the carved display and the cached base solid. */
@@ -2524,6 +2580,120 @@ export class TerrainBuilder {
     this.csgSurfaceData = null
     this.csgSurfaceTemp = null
     this.csgSurfaceHum = null
+  }
+
+  // --- Low-poly grid (RCT-style) representation ----------------------------
+  public getTerrainStyle(): 'smooth' | 'grid' | 'hex' { return this.terrainStyle }
+  public getGridCells(): number { return this.gridCells }
+  public getGridStep(): number { return this.gridStep }
+
+  /** Switch the terrain display between the smooth mesh and a coarse low-poly tiling. */
+  public setTerrainStyle(style: 'smooth' | 'grid' | 'hex'): void {
+    this.terrainStyle = style
+    if (style !== 'smooth') {
+      if (this.csgActive) this.exitCsgMode() // grid and CSG are separate representations
+      this.rebuildGridMesh()
+    } else {
+      this.clearGridMesh()
+      if (this.terrain) this.terrain.visible = true
+    }
+  }
+
+  public setGridCells(n: number): void { this.gridCells = n; if (this.terrainStyle !== 'smooth') this.rebuildGridMesh() }
+  public setGridStep(s: number): void { this.gridStep = s; if (this.terrainStyle !== 'smooth') this.rebuildGridMesh() }
+  public getGridSizeMode(): 'count' | 'diameter' { return this.gridSizeMode }
+  public getGridTileDiameter(): number { return this.gridTileDiameter }
+  public setGridSizeMode(m: 'count' | 'diameter'): void { this.gridSizeMode = m; if (this.terrainStyle !== 'smooth') this.rebuildGridMesh() }
+  public setGridTileDiameter(d: number): void { this.gridTileDiameter = d; if (this.terrainStyle !== 'smooth') this.rebuildGridMesh() }
+
+  /**
+   * Tiles across the island. In 'count' mode this is `gridCells`; in 'diameter' mode
+   * it's derived from the target tile diameter so the physical tile size is fixed
+   * regardless of island size. Hex columns are spaced 0.75·diameter (flat-top width
+   * = 2R = diameter); square cells are exactly diameter. Capped to keep meshes sane.
+   */
+  private effectiveCells(): number {
+    if (this.gridSizeMode === 'count') return this.gridCells
+    const size = this.config.size * 1000
+    const d = Math.max(1, this.gridTileDiameter)
+    const raw = this.terrainStyle === 'hex' ? size / (0.75 * d) : size / d
+    return Math.max(2, Math.min(GRID_MAX_CELLS, Math.round(raw)))
+  }
+
+  /** What the current 'by size' request actually resolves to (so the UI can flag the cap). */
+  public getTileSizingInfo(): { cells: number; capped: boolean; effectiveDiameter: number } {
+    const size = this.config.size * 1000
+    const d = Math.max(1, this.gridTileDiameter)
+    const raw = this.terrainStyle === 'hex' ? size / (0.75 * d) : size / d
+    const cells = Math.max(2, Math.min(GRID_MAX_CELLS, Math.round(raw)))
+    const effectiveDiameter = this.terrainStyle === 'hex' ? size / (0.75 * cells) : size / cells
+    return { cells, capped: Math.round(raw) > GRID_MAX_CELLS, effectiveDiameter }
+  }
+
+  /**
+   * Build/refresh the low-poly tile mesh (square grid or hex) carrying continuous climate.
+   * `recomputeClimate` true (default) syncs brush edits and re-derives the global climate
+   * field — correct but heavy, so it's used at stroke-end / param changes. false is the
+   * live path used mid-stroke: it takes the brush's latest heights but reuses the current
+   * climate (only the geometry moves; colours settle on release), so it's cheap per frame.
+   */
+  private rebuildGridMesh(recomputeClimate = true): void {
+    let height: Float32Array | null
+    if (recomputeClimate) {
+      this.syncHeightFromBrush()
+      height = this.lastHeightData
+    } else {
+      height = this.brushSystem.getHeightData() // latest edits, without nulling climate
+    }
+    if (!height || height.length === 0) return
+    if (!this.climateFields) this.computeClimateFields()
+    const temp = this.climateFields?.temperature ?? null
+    const hum = this.climateFields?.humidity ?? null
+    const opts = { cells: this.effectiveCells(), sizeUnits: this.config.size * 1000, step: this.gridStep }
+    const geo = this.terrainStyle === 'hex'
+      ? buildHexGeometry(height, this.config.resolution, temp, hum, opts)
+      : buildGridGeometry(height, this.config.resolution, temp, hum, opts)
+
+    this.clearGridMesh()
+    if (!this.gridClassifyMaterial) {
+      this.gridClassifyMaterial = new TerrainMaterial({
+        classifyFromSurfData: true, doubleSide: true, flatShading: true, shareTexturesFrom: this.terrainMaterial
+      })
+    }
+    const seaLevel = this.config.island.enabled ? this.config.island.seaLevel : this.lastMinHeight
+    this.gridClassifyMaterial.setClassifyParams(seaLevel, this.config.biome.beachHeight, this.config.biome.blendMargin)
+    this.gridClassifyMaterial.updateHeightRange(this.lastMinHeight, this.lastMaxHeight)
+
+    const mesh = new THREE.Mesh(geo, this.gridClassifyMaterial.getMaterial())
+    mesh.position.y = this.terrain ? this.terrain.position.y : 0
+    this.scene.add(mesh)
+    this.gridMesh = mesh
+    this.applyGridViewMode() // honor the active climate view on the tiles
+    if (this.terrain) this.terrain.visible = false
+  }
+
+  /** Rebuild the tile preview from the latest heightfield (after a brush/erosion/river edit).
+   *  No-op outside a tile representation or while carving (the carved solid is shown then). */
+  public refreshTileMesh(live = false): void {
+    if (this.terrainStyle === 'smooth' || this.csgActive) return
+    this.rebuildGridMesh(!live) // live = mid-stroke (geometry only); else full (recompute climate)
+  }
+
+  /** Make the tile mesh honor the active climate view (shares the CSG view machinery). */
+  private applyGridViewMode(): void {
+    if (!this.gridMesh || !this.gridClassifyMaterial) return
+    if (!this.gridDebugMaterial) {
+      this.gridDebugMaterial = new THREE.MeshStandardMaterial({ vertexColors: true, flatShading: true, roughness: 1, metalness: 0, side: THREE.DoubleSide })
+    }
+    this.applyViewToMesh(this.gridMesh, this.gridClassifyMaterial, this.gridDebugMaterial)
+  }
+
+  private clearGridMesh(): void {
+    if (this.gridMesh) {
+      this.scene.remove(this.gridMesh)
+      this.gridMesh.geometry.dispose()
+      this.gridMesh = null
+    }
   }
 
   /**
@@ -2579,32 +2749,57 @@ export class TerrainBuilder {
    */
   public async exportCarvedSolid(): Promise<{ glb: ArrayBuffer; manifestJson: string } | null> {
     if (!this.csgMesh) return null
+    const glb = await this.exportMeshToGlb(this.csgMesh)
+    return { glb, manifestJson: this.buildSolidManifestJson('island-carved.glb') }
+  }
 
-    const glb = await new Promise<ArrayBuffer>((resolve, reject) => {
+  /**
+   * Commit the low-poly tiles (square grid or hex) as a closed, flat-bottomed solid:
+   * a binary glTF + the same `weltenbauer-solid` contract as the carved export. Tiny
+   * triangle count, continuous `_SURFDATA` (no baked biome). Null unless in tile mode.
+   */
+  public async exportTileSolid(): Promise<{ glb: ArrayBuffer; manifestJson: string } | null> {
+    if (this.terrainStyle === 'smooth' || !this.gridMesh) return null
+    const solid = solidifyTileGeometry(this.gridMesh.geometry as THREE.BufferGeometry, 20)
+    const mesh = new THREE.Mesh(solid, new THREE.MeshStandardMaterial())
+    mesh.position.y = this.gridMesh.position.y
+    try {
+      const glb = await this.exportMeshToGlb(mesh)
+      return { glb, manifestJson: this.buildSolidManifestJson('island-tiles.glb') }
+    } finally {
+      solid.dispose()
+    }
+  }
+
+  private exportMeshToGlb(mesh: THREE.Mesh): Promise<ArrayBuffer> {
+    return new Promise<ArrayBuffer>((resolve, reject) => {
       new GLTFExporter().parse(
-        this.csgMesh!,
+        mesh,
         (result: ArrayBuffer | object) => resolve(result as ArrayBuffer),
         (error: unknown) => reject(error),
         { binary: true }
       )
     })
+  }
 
+  /** The shared `weltenbauer-solid` JSON contract (biome legend + classify recipe). */
+  private buildSolidManifestJson(meshName: string): string {
     const seaLevel = this.config.island.enabled ? this.config.island.seaLevel : this.lastMinHeight
     const manifest = {
       format: 'weltenbauer-solid',
       version: 1,
-      mesh: 'island-carved.glb',
+      mesh: meshName,
       world: { sizeKm: this.config.size, seaLevel },
       seed: this.advancedTerrainGenerator.getSeed(),
       attributes: {
         _SURFDATA: 'vec3 float per vertex — x = temperature (°C), y = humidity (0..1), z = surfaceHeight (m, terrain height of this column)'
       },
-      depth: 'depthBelowSurface = _SURFDATA.z − vertexLocalY; ≈0 on the surface, larger on cut/cave walls (use it to shade interior strata)',
+      depth: 'depthBelowSurface = _SURFDATA.z − vertexLocalY; ≈0 on the surface, larger on interior/wall faces (use it to shade strata)',
       classification: { seaLevel, beachHeight: this.config.biome.beachHeight, blendMargin: this.config.biome.blendMargin },
       recipe: 'Per fragment/sample: classify (surfaceHeight, _SURFDATA.x, _SURFDATA.y) into biome weights with the classification params + biomes legend (see docs/solid-export.md), then blend your own per-biome PBR materials; shade interior faces toward rock/bedrock by depth. Texture-agnostic — use our biomes or your own, or ignore them and shade straight from climate.',
       biomes: BiomeSystem.legendBiomes()
     }
-    return { glb, manifestJson: JSON.stringify(manifest, null, 2) }
+    return JSON.stringify(manifest, null, 2)
   }
 
   // --- CSG carve tools (surface-aware digging) -----------------------------
@@ -3103,6 +3298,9 @@ export class TerrainBuilder {
     this.terrainMaterial.dispose()
     if (this.csgSolidMaterial) { this.csgSolidMaterial.dispose(); this.csgSolidMaterial = null }
     if (this.csgDebugMaterial) { this.csgDebugMaterial.dispose(); this.csgDebugMaterial = null }
+    this.clearGridMesh()
+    if (this.gridClassifyMaterial) { this.gridClassifyMaterial.dispose(); this.gridClassifyMaterial = null }
+    if (this.gridDebugMaterial) { this.gridDebugMaterial.dispose(); this.gridDebugMaterial = null }
 
     // Clean up preview canvas
     if (this.noisePreviewCanvas && this.noisePreviewCanvas.parentNode) {

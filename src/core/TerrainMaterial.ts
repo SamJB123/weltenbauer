@@ -32,6 +32,8 @@ export interface TerrainMaterialOptions {
   classifyFromSurfData?: boolean
   /** Render both faces (cave interiors need it). */
   doubleSide?: boolean
+  /** Flat (per-face) shading for the faceted low-poly tile look. */
+  flatShading?: boolean
   /** Reuse another material's already-loaded textures instead of loading a fresh
    *  (and async-racing) set. The solid shares the flat terrain's textures so its
    *  node graph captures the real, loaded textures — not transient fallbacks. */
@@ -268,7 +270,8 @@ export class TerrainMaterial {
     const material = new THREE.MeshStandardMaterial({
       metalness: 0,
       roughness: 0.8,
-      side: this.opts.doubleSide ? THREE.DoubleSide : THREE.FrontSide
+      side: this.opts.doubleSide ? THREE.DoubleSide : THREE.FrontSide,
+      flatShading: !!this.opts.flatShading
     })
 
     // TSL uniforms matching the reference code
