@@ -15,7 +15,9 @@
       "WebFetch(domain:raw.githubusercontent.com)",
       "Bash(node -e \"const e=require\\('./node_modules/three-mesh-bvh/package.json'\\).exports; console.log\\(JSON.stringify\\(e,null,1\\)\\)\")",
       "Bash(node -e \"const t=require\\('./node_modules/@types/three/src/Three.WebGPU.d.ts'\\)\")",
-      "Bash(npx vite *)"
+      "Bash(npx vite *)",
+      "Bash(ls src/*.d.ts vite-env.d.ts src/vite-env.d.ts)",
+      "Bash(grep -A3 '\"include\"' tsconfig.json)"
     ]
   }
 }

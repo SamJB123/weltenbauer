@@ -1,10 +1,10 @@
 import { TerrainBuilder } from './core/TerrainBuilder'
-import { UIController } from './ui/UIController'
+import { WeltUI } from './ui/welt/WeltUI'
 
 class App {
   private terrainBuilder: TerrainBuilder
-  // @ts-ignore - UI controller instance needed for initialization
-  private _uiController: UIController // UI controller for terrain manipulation interface
+  // @ts-ignore - UI instance needed for initialization
+  private _ui: WeltUI // control surface for terrain manipulation
 
   constructor() {
     const canvas = document.getElementById('canvas') as HTMLCanvasElement
@@ -13,11 +13,11 @@ class App {
     }
 
     this.terrainBuilder = new TerrainBuilder(canvas)
-    this._uiController = new UIController(this.terrainBuilder)
-    
-    // Connect UI controller to terrain builder for noise layers management
-    this.terrainBuilder.setUIController(this._uiController)
-    
+    this._ui = new WeltUI(this.terrainBuilder)
+
+    // Connect UI to terrain builder (progress overlay, noise-layer + cutter refresh)
+    this.terrainBuilder.setUIController(this._ui)
+
     this.init()
   }
 
