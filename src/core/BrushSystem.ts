@@ -1,6 +1,6 @@
 import * as THREE from 'three/webgpu'
 
-export type BrushMode = 'raise' | 'lower' | 'smooth' | 'flatten' | 'mountain'
+export type BrushMode = 'raise' | 'lower' | 'smooth' | 'flatten' | 'level' | 'mountain'
 
 export interface MountainPreset {
   name: string
@@ -17,6 +17,8 @@ export interface BrushSettings {
   size: number
   strength: number
   mode: BrushMode
+  /** Absolute target height (heightfield units) the 'level' brush eases toward. */
+  targetHeight?: number
   mountainPreset?: MountainPreset
 }
 
@@ -56,7 +58,8 @@ export class BrushSystem {
   private brushSettings: BrushSettings = {
     size: 10,
     strength: 0.5,
-    mode: 'raise'
+    mode: 'raise',
+    targetHeight: 0
   }
 
   private raycaster = new THREE.Raycaster()
@@ -326,6 +329,13 @@ export class BrushSystem {
             const heightDiff = this.flattenHeight - currentHeight
             this.heightData[index] = currentHeight + heightDiff * effectiveStrength * 0.4
             break
+
+          case 'level': {
+            // Ease towards a user-specified absolute target height.
+            const target = this.brushSettings.targetHeight ?? 0
+            this.heightData[index] = currentHeight + (target - currentHeight) * effectiveStrength * 0.4
+            break
+          }
 
           case 'mountain':
             if (this.brushSettings.mountainPreset) {

@@ -185,15 +185,31 @@ export class WeltUI {
     // Sculpt brush — a modal tool (switch to Sculpt mode to use it).
     const sculpt = group('Sculpt brush', { open: true })
     const bs = this.tb.getBrushSystem().getBrushSettings()
+    const brush = this.tb.getBrushSystem()
+    const modeLabels: Record<BrushMode, string> = {
+      raise: 'Raise', lower: 'Lower', smooth: 'Smooth', flatten: 'Flatten', level: 'Level (target)', mountain: 'Mountain'
+    }
     sculpt.body.append(
       hint('Switch to 🖌 Sculpt (bottom bar) then drag on the terrain.'),
       select<BrushMode>({
         label: 'Brush', value: bs.mode,
-        options: (['raise', 'lower', 'smooth', 'flatten', 'mountain'] as BrushMode[]).map(m => ({ label: m, value: m })),
-        onChange: v => this.tb.getBrushSystem().setBrushSettings({ mode: v })
-      }),
-      slider({ label: 'Size', min: 1, max: 500, step: 1, value: bs.size, unit: 'm', onChange: v => this.tb.getBrushSystem().setBrushSettings({ size: v }) }),
-      slider({ label: 'Strength', min: 0.1, max: 2, step: 0.1, value: bs.strength, onChange: v => this.tb.getBrushSystem().setBrushSettings({ strength: v }) })
+        options: (['raise', 'lower', 'smooth', 'flatten', 'level', 'mountain'] as BrushMode[]).map(m => ({ label: modeLabels[m], value: m })),
+        onChange: v => { brush.setBrushSettings({ mode: v }); this.renderStage() } // re-render to show/hide the target slider
+      })
+    )
+    // 'Level' eases the terrain toward an absolute target elevation (shown relative
+    // to sea level, like the cursor readout). Convert to/from heightfield units.
+    if (bs.mode === 'level') {
+      const seaLevel = this.tb.getConfig().island.seaLevel
+      sculpt.body.append(slider({
+        label: 'Target elevation', min: -200, max: 400, step: 1, unit: 'm',
+        value: (bs.targetHeight ?? 0) - seaLevel,
+        onChange: v => brush.setBrushSettings({ targetHeight: v + seaLevel })
+      }))
+    }
+    sculpt.body.append(
+      slider({ label: 'Size', min: 1, max: 500, step: 1, value: bs.size, unit: 'm', onChange: v => brush.setBrushSettings({ size: v }) }),
+      slider({ label: 'Strength', min: 0.1, max: 2, step: 0.1, value: bs.strength, onChange: v => brush.setBrushSettings({ strength: v }) })
     )
 
     const presets = group('Presets', {})

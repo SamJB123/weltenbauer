@@ -43,28 +43,48 @@ export interface SliderOpts {
   unit?: string
   /** Fire on every drag (input) rather than only on release (change). */
   live?: boolean
-  format?: (v: number) => string
   onChange: (v: number) => void
 }
 
-/** Range slider with a live numeric readout. */
+/** Range slider with an editable numeric readout (drag the slider or type the value). */
 export function slider(o: SliderOpts): HTMLElement {
-  const readout = h('span', { class: 'w-slider-val' })
-  const input = h('input', {
+  const num = h('input', {
+    class: 'w-slider-num', type: 'number',
+    min: String(o.min), max: String(o.max), step: String(o.step), value: String(o.value)
+  }) as HTMLInputElement
+  const range = h('input', {
     class: 'w-slider', type: 'range',
     min: String(o.min), max: String(o.max), step: String(o.step), value: String(o.value)
-  } as any)
-  const fmt = (v: number) => o.format ? o.format(v) : `${v}${o.unit ? ' ' + o.unit : ''}`
-  readout.textContent = fmt(o.value)
-  input.addEventListener('input', () => {
-    const v = parseFloat(input.value)
-    readout.textContent = fmt(v)
+  }) as HTMLInputElement
+
+  const clamp = (v: number) => Math.min(o.max, Math.max(o.min, v))
+
+  range.addEventListener('input', () => {
+    const v = parseFloat(range.value)
+    num.value = String(v)
     if (o.live) o.onChange(v)
   })
-  input.addEventListener('change', () => { if (!o.live) o.onChange(parseFloat(input.value)) })
+  range.addEventListener('change', () => { if (!o.live) o.onChange(parseFloat(range.value)) })
+
+  // Typed entry: clamp to range, sync the slider, and commit on Enter/blur.
+  const commit = () => {
+    let v = parseFloat(num.value)
+    if (Number.isNaN(v)) v = parseFloat(range.value)
+    v = clamp(v)
+    num.value = String(v)
+    range.value = String(v)
+    o.onChange(v)
+  }
+  num.addEventListener('change', commit)
+  num.addEventListener('keydown', (e) => { if ((e as KeyboardEvent).key === 'Enter') { commit(); num.blur() } })
+
+  const readout = o.unit
+    ? h('div', { class: 'w-slider-readout' }, [num, h('span', { class: 'w-slider-unit', text: o.unit })])
+    : h('div', { class: 'w-slider-readout' }, [num])
+
   return h('div', { class: 'w-field w-field-col' }, [
     h('div', { class: 'w-field-head' }, [h('span', { class: 'w-field-label', text: o.label }), readout]),
-    input
+    range
   ])
 }
 
